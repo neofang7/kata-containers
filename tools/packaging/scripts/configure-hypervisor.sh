@@ -526,7 +526,7 @@ main() {
 		die "cannot determine qemu version from file $qemu_version_file"
 
 	if ! gt_eq "${qemu_version}" "6.1.0" ; then
-	    die "Kata requires QEMU >= 6.1.0"
+	    echo "Kata requires QEMU >= 6.1.0"
 	fi
 
 	local gcc_version_major=$(gcc -dumpversion | cut -f1 -d.)
