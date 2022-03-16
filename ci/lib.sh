@@ -5,7 +5,7 @@
 
 set -o nounset
 
-export tests_repo="${tests_repo:-github.com/arronwy/tests}"
+export tests_repo="${tests_repo:-github.com/neofang7/tests}"
 export tests_repo_dir="$GOPATH/src/$tests_repo"
 export branch="${target_branch:-main}"
 
