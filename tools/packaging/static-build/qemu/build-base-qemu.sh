@@ -26,7 +26,7 @@ qemu_tar="${4:-}"
 [ -n "$qemu_repo" ] || die "qemu repo not provided"
 [ -n "$qemu_version" ] || die "qemu version not provided"
 
-info "Build ${qemu_repo} version: ${qemu_version}"
+info "Build ${qemu_repo} version: ${qemu_version} script_dir: ${script_dir}"
 
 http_proxy="${http_proxy:-}"
 https_proxy="${https_proxy:-}"
