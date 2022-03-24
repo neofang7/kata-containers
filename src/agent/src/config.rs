@@ -24,6 +24,7 @@ const CONTAINER_PIPE_SIZE_OPTION: &str = "agent.container_pipe_size";
 const UNIFIED_CGROUP_HIERARCHY_OPTION: &str = "agent.unified_cgroup_hierarchy";
 const CONFIG_FILE: &str = "agent.config_file";
 const CONTAINER_POLICY_FILE: &str = "agent.container_policy_file";
+const HTTPS_PROXY: &str = "agent.https_proxy";
 
 const DEFAULT_LOG_LEVEL: slog::Level = slog::Level::Info;
 const DEFAULT_HOTPLUG_TIMEOUT: time::Duration = time::Duration::from_secs(3);
@@ -84,6 +85,7 @@ pub struct AgentConfig {
     pub supports_seccomp: bool,
     pub container_policy_path: String,
     pub aa_kbc_params: String,
+    pub https_proxy: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +103,7 @@ pub struct AgentConfigBuilder {
     pub endpoints: Option<EndpointsConfig>,
     pub container_policy_path: Option<String>,
     pub aa_kbc_params: Option<String>,
+    pub https_proxy: Option<String>,
 }
 
 macro_rules! config_override {
@@ -164,6 +167,7 @@ impl Default for AgentConfig {
             supports_seccomp: rpc::have_seccomp(),
             container_policy_path: String::from(""),
             aa_kbc_params: String::from(""),
+            https_proxy: String::from(""),
         }
     }
 }
@@ -194,6 +198,7 @@ impl FromStr for AgentConfig {
         config_override!(agent_config_builder, agent_config, tracing);
         config_override!(agent_config_builder, agent_config, container_policy_path);
         config_override!(agent_config_builder, agent_config, aa_kbc_params);
+        config_override!(agent_config_builder, agent_config, https_proxy);
 
         // Populate the allowed endpoints hash set, if we got any from the config file.
         if let Some(endpoints) = agent_config_builder.endpoints {
@@ -298,6 +303,8 @@ impl AgentConfig {
                 config.container_policy_path,
                 get_container_policy_path_value
             );
+
+            parse_cmdline_param!(param, HTTPS_PROXY, config.https_proxy, get_string_value);
         }
 
         if let Ok(addr) = env::var(SERVER_ADDR_ENV_VAR) {
@@ -924,6 +931,16 @@ mod tests {
             TestData {
                 contents: "agent.container_policy_file=/etc/containers/policy.json",
                 container_policy_path: "/etc/containers/policy.json",
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.https_proxy=http://proxy.url.com",
+                https_proxy: "http://proxy.url.com",
+                ..Default::default()
+            },
+            TestData {
+                contents: "agent.https_proxy=proxy.url.com",
+                https_proxy: "proxy.url.com",
                 ..Default::default()
             },
         ];
