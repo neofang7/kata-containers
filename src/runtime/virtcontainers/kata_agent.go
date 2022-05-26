@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/docker/go-units"
+	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	resCtrl "github.com/kata-containers/kata-containers/src/runtime/pkg/resourcecontrol"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/uuid"
@@ -31,7 +32,6 @@ import (
 	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 
 	"github.com/gogo/protobuf/proto"
@@ -165,6 +165,15 @@ func getPagesizeFromOpt(fsOpts []string) string {
 		}
 	}
 	return ""
+}
+
+func getFSGroupChangePolicy(policy volume.FSGroupChangePolicy) pbTypes.FSGroupChangePolicy {
+	switch policy {
+	case volume.FSGroupChangeOnRootMismatch:
+		return pbTypes.FSGroupChangePolicy_OnRootMismatch
+	default:
+		return pbTypes.FSGroupChangePolicy_Always
+	}
 }
 
 // Shared path handling:
@@ -407,7 +416,7 @@ func (k *kataAgent) configure(ctx context.Context, h Hypervisor, id, sharePath s
 		}
 	case types.MockHybridVSock:
 	default:
-		return vcTypes.ErrInvalidConfigType
+		return types.ErrInvalidConfigType
 	}
 
 	// Neither create shared directory nor add 9p device if hypervisor
@@ -910,7 +919,6 @@ func (k *kataAgent) constrainGRPCSpec(grpcSpec *grpc.Spec, passSeccomp bool, str
 	grpcSpec.Linux.Resources.Devices = nil
 	grpcSpec.Linux.Resources.Pids = nil
 	grpcSpec.Linux.Resources.BlockIO = nil
-	grpcSpec.Linux.Resources.HugepageLimits = nil
 	grpcSpec.Linux.Resources.Network = nil
 	if grpcSpec.Linux.Resources.CPU != nil {
 		grpcSpec.Linux.Resources.CPU.Cpus = ""
@@ -1469,6 +1477,12 @@ func (k *kataAgent) handleDeviceBlockVolume(c *Container, m Mount, device api.De
 	if len(vol.Options) == 0 {
 		vol.Options = m.Options
 	}
+	if m.FSGroup != nil {
+		vol.FsGroup = &grpc.FSGroup{
+			GroupId:           uint32(*m.FSGroup),
+			GroupChangePolicy: getFSGroupChangePolicy(m.FSGroupChangePolicy),
+		}
+	}
 
 	return vol, nil
 }
@@ -1549,11 +1563,9 @@ func (k *kataAgent) handleBlkOCIMounts(c *Container, spec *specs.Spec) ([]*grpc.
 		// Each device will be mounted at a unique location within the VM only once. Mounting
 		// to the container specific location is handled within the OCI spec. Let's ensure that
 		// the storage mount point is unique for each device. This is then utilized as the source
-		// in the OCI spec. If multiple containers mount the same block device, it's refcounted inside
+		// in the OCI spec. If multiple containers mount the same block device, it's ref-counted inside
 		// the guest by Kata agent.
-		filename := b64.StdEncoding.EncodeToString([]byte(vol.Source))
-		// Make the base64 encoding path safe.
-		filename = strings.ReplaceAll(filename, "/", "_")
+		filename := b64.URLEncoding.EncodeToString([]byte(vol.Source))
 		path := filepath.Join(kataGuestSandboxStorageDir(), filename)
 
 		// Update applicable OCI mount source
@@ -2134,7 +2146,7 @@ func (k *kataAgent) copyFile(ctx context.Context, src, dst string) error {
 	return nil
 }
 
-func (k *kataAgent) addSwap(ctx context.Context, PCIPath vcTypes.PciPath) error {
+func (k *kataAgent) addSwap(ctx context.Context, PCIPath types.PciPath) error {
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "addSwap", kataAgentTracingTags)
 	defer span.End()
 

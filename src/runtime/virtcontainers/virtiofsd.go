@@ -6,7 +6,6 @@
 package virtcontainers
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"net"
@@ -70,8 +69,6 @@ type virtiofsd struct {
 	sourcePath string
 	// extraArgs list of extra args to append to virtiofsd command
 	extraArgs []string
-	// debug flag
-	debug bool
 	// PID process ID of virtiosd process
 	PID int
 }
@@ -136,24 +133,14 @@ func (v *virtiofsd) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 
 	v.Logger().WithField("path", v.path).Info()
 	v.Logger().WithField("args", strings.Join(args, " ")).Info()
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return pid, err
-	}
 
 	if err = utils.StartCmd(cmd); err != nil {
 		return pid, err
 	}
 
-	// Monitor virtiofsd's stderr and stop sandbox if virtiofsd quits
 	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			v.Logger().WithField("source", "virtiofsd").Info(scanner.Text())
-		}
-		v.Logger().Info("virtiofsd quits")
-		// Wait to release resources of virtiofsd process
 		cmd.Process.Wait()
+		v.Logger().Info("virtiofsd quits")
 		if onQuit != nil {
 			onQuit()
 		}
@@ -199,14 +186,8 @@ func (v *virtiofsd) args(FdSocketNumber uint) ([]string, error) {
 		"-o", "source=" + v.sourcePath,
 		// fd number of vhost-user socket
 		fmt.Sprintf("--fd=%v", FdSocketNumber),
-	}
-
-	if v.debug {
-		// enable debug output (implies -f)
-		args = append(args, "-d")
-	} else {
 		// foreground operation
-		args = append(args, "-f")
+		"-f",
 	}
 
 	if len(v.extraArgs) != 0 {

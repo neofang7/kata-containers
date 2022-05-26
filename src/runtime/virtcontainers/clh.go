@@ -32,7 +32,6 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 )
 
@@ -165,6 +164,7 @@ type cloudHypervisor struct {
 	APIClient      clhClient
 	ctx            context.Context
 	id             string
+	devicesIds     map[string]string
 	vmconfig       chclient.VmConfig
 	state          CloudHypervisorState
 	config         HypervisorConfig
@@ -234,7 +234,6 @@ func (clh *cloudHypervisor) createVirtiofsDaemon(sharedPath string) (VirtiofsDae
 		sourcePath: sharedPath,
 		socketPath: virtiofsdSocketPath,
 		extraArgs:  clh.config.VirtioFSExtraArgs,
-		debug:      clh.config.Debug,
 		cache:      clh.config.VirtioFSCache,
 	}, nil
 }
@@ -302,7 +301,6 @@ func (clh *cloudHypervisor) loadVirtiofsDaemon(sharedPath string) (VirtiofsDaemo
 	return &virtiofsd{
 		PID:        clh.state.VirtiofsDaemonPid,
 		sourcePath: sharedPath,
-		debug:      clh.config.Debug,
 		socketPath: virtiofsdSocketPath,
 	}, nil
 }
@@ -360,6 +358,7 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 
 	clh.id = id
 	clh.state.state = clhNotReady
+	clh.devicesIds = make(map[string]string)
 
 	clh.Logger().WithField("function", "CreateVM").Info("creating Sandbox")
 
@@ -443,6 +442,11 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 		if clh.config.ConfidentialGuest {
 			disk := chclient.NewDiskConfig(imagePath)
 			disk.SetReadonly(true)
+
+			diskRateLimiterConfig := clh.getDiskRateLimiterConfig()
+			if diskRateLimiterConfig != nil {
+				disk.SetRateLimiterConfig(*diskRateLimiterConfig)
+			}
 
 			if clh.vmconfig.Disks != nil {
 				*clh.vmconfig.Disks = append(*clh.vmconfig.Disks, *disk)
@@ -533,7 +537,7 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 	return nil
 }
 
-// startSandbox will start the VMM and boot the virtual machine for the given sandbox.
+// StartVM will start the VMM and boot the virtual machine for the given sandbox.
 func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 	span, _ := katatrace.Trace(ctx, clh.Logger(), "StartVM", clhTracingTags, map[string]string{"sandbox_id": clh.id})
 	defer span.End()
@@ -587,8 +591,8 @@ func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 	return nil
 }
 
-// getSandboxConsole builds the path of the console where we can read
-// logs coming from the sandbox.
+// GetVMConsole builds the path of the console where we can read logs coming
+// from the sandbox.
 func (clh *cloudHypervisor) GetVMConsole(ctx context.Context, id string) (string, string, error) {
 	clh.Logger().WithField("function", "GetVMConsole").WithField("id", id).Info("Get Sandbox Console")
 	master, slave, err := console.NewPty()
@@ -627,18 +631,18 @@ func clhDriveIndexToID(i int) string {
 // and/or kernel enumerates it.  They get away with it only because
 // they don't use bridges, and so the bus is always 0.  Under that
 // assumption convert a clh PciDeviceInfo into a PCI path
-func clhPciInfoToPath(pciInfo chclient.PciDeviceInfo) (vcTypes.PciPath, error) {
+func clhPciInfoToPath(pciInfo chclient.PciDeviceInfo) (types.PciPath, error) {
 	tokens := strings.Split(pciInfo.Bdf, ":")
 	if len(tokens) != 3 || tokens[0] != "0000" || tokens[1] != "00" {
-		return vcTypes.PciPath{}, fmt.Errorf("Unexpected PCI address %q from clh hotplug", pciInfo.Bdf)
+		return types.PciPath{}, fmt.Errorf("Unexpected PCI address %q from clh hotplug", pciInfo.Bdf)
 	}
 
 	tokens = strings.Split(tokens[2], ".")
 	if len(tokens) != 2 || tokens[1] != "0" || len(tokens[0]) != 2 {
-		return vcTypes.PciPath{}, fmt.Errorf("Unexpected PCI address %q from clh hotplug", pciInfo.Bdf)
+		return types.PciPath{}, fmt.Errorf("Unexpected PCI address %q from clh hotplug", pciInfo.Bdf)
 	}
 
-	return vcTypes.PciPathFromString(tokens[0])
+	return types.PciPathFromString(tokens[0])
 }
 
 func (clh *cloudHypervisor) hotplugAddBlockDevice(drive *config.BlockDrive) error {
@@ -667,7 +671,11 @@ func (clh *cloudHypervisor) hotplugAddBlockDevice(drive *config.BlockDrive) erro
 	clhDisk := *chclient.NewDiskConfig(drive.File)
 	clhDisk.Readonly = &drive.ReadOnly
 	clhDisk.VhostUser = func(b bool) *bool { return &b }(false)
-	clhDisk.Id = &driveID
+
+	diskRateLimiterConfig := clh.getDiskRateLimiterConfig()
+	if diskRateLimiterConfig != nil {
+		clhDisk.SetRateLimiterConfig(*diskRateLimiterConfig)
+	}
 
 	pciInfo, _, err := cl.VmAddDiskPut(ctx, clhDisk)
 
@@ -675,6 +683,7 @@ func (clh *cloudHypervisor) hotplugAddBlockDevice(drive *config.BlockDrive) erro
 		return fmt.Errorf("failed to hotplug block device %+v %s", drive, openAPIClientError(err))
 	}
 
+	clh.devicesIds[driveID] = pciInfo.GetId()
 	drive.PCIPath, err = clhPciInfoToPath(pciInfo)
 
 	return err
@@ -688,11 +697,11 @@ func (clh *cloudHypervisor) hotPlugVFIODevice(device *config.VFIODev) error {
 	// Create the clh device config via the constructor to ensure default values are properly assigned
 	clhDevice := *chclient.NewVmAddDevice()
 	clhDevice.Path = &device.SysfsDev
-	clhDevice.Id = &device.ID
 	pciInfo, _, err := cl.VmAddDevicePut(ctx, clhDevice)
 	if err != nil {
 		return fmt.Errorf("Failed to hotplug device %+v %s", device, openAPIClientError(err))
 	}
+	clh.devicesIds[device.ID] = pciInfo.GetId()
 
 	// clh doesn't use bridges, so the PCI path is simply the slot
 	// number of the device.  This will break if clh starts using
@@ -709,7 +718,7 @@ func (clh *cloudHypervisor) hotPlugVFIODevice(device *config.VFIODev) error {
 		return fmt.Errorf("Unexpected PCI address %q from clh hotplug", pciInfo.Bdf)
 	}
 
-	device.GuestPciPath, err = vcTypes.PciPathFromString(tokens[0])
+	device.GuestPciPath, err = types.PciPathFromString(tokens[0])
 
 	return err
 }
@@ -753,13 +762,15 @@ func (clh *cloudHypervisor) HotplugRemoveDevice(ctx context.Context, devInfo int
 	ctx, cancel := context.WithTimeout(context.Background(), clhHotPlugAPITimeout*time.Second)
 	defer cancel()
 
+	originalDeviceID := clh.devicesIds[deviceID]
 	remove := *chclient.NewVmRemoveDevice()
-	remove.Id = &deviceID
+	remove.Id = &originalDeviceID
 	_, err := cl.VmRemoveDevicePut(ctx, remove)
 	if err != nil {
 		err = fmt.Errorf("failed to hotplug remove (unplug) device %+v: %s", devInfo, openAPIClientError(err))
 	}
 
+	delete(clh.devicesIds, deviceID)
 	return nil, err
 }
 
@@ -895,7 +906,7 @@ func (clh *cloudHypervisor) ResumeVM(ctx context.Context) error {
 	return nil
 }
 
-// stopSandbox will stop the Sandbox's VM.
+// StopVM will stop the Sandbox's VM.
 func (clh *cloudHypervisor) StopVM(ctx context.Context, waitOnly bool) (err error) {
 	span, _ := katatrace.Trace(ctx, clh.Logger(), "StopVM", clhTracingTags, map[string]string{"sandbox_id": clh.id})
 	defer span.End()
@@ -1306,6 +1317,52 @@ func (clh *cloudHypervisor) addVSock(cid int64, path string) {
 	clh.vmconfig.Vsock = chclient.NewVsockConfig(cid, path)
 }
 
+func (clh *cloudHypervisor) getRateLimiterConfig(bwSize, bwOneTimeBurst, opsSize, opsOneTimeBurst int64) *chclient.RateLimiterConfig {
+	if bwSize == 0 && opsSize == 0 {
+		return nil
+	}
+
+	rateLimiterConfig := chclient.NewRateLimiterConfig()
+
+	if bwSize != 0 {
+		bwTokenBucket := chclient.NewTokenBucket(bwSize, int64(utils.DefaultRateLimiterRefillTimeMilliSecs))
+
+		if bwOneTimeBurst != 0 {
+			bwTokenBucket.SetOneTimeBurst(bwOneTimeBurst)
+		}
+
+		rateLimiterConfig.SetBandwidth(*bwTokenBucket)
+	}
+
+	if opsSize != 0 {
+		opsTokenBucket := chclient.NewTokenBucket(opsSize, int64(utils.DefaultRateLimiterRefillTimeMilliSecs))
+
+		if opsOneTimeBurst != 0 {
+			opsTokenBucket.SetOneTimeBurst(opsOneTimeBurst)
+		}
+
+		rateLimiterConfig.SetOps(*opsTokenBucket)
+	}
+
+	return rateLimiterConfig
+}
+
+func (clh *cloudHypervisor) getNetRateLimiterConfig() *chclient.RateLimiterConfig {
+	return clh.getRateLimiterConfig(
+		int64(utils.RevertBytes(uint64(clh.config.NetRateLimiterBwMaxRate/8))),
+		int64(utils.RevertBytes(uint64(clh.config.NetRateLimiterBwOneTimeBurst/8))),
+		clh.config.NetRateLimiterOpsMaxRate,
+		clh.config.NetRateLimiterOpsOneTimeBurst)
+}
+
+func (clh *cloudHypervisor) getDiskRateLimiterConfig() *chclient.RateLimiterConfig {
+	return clh.getRateLimiterConfig(
+		int64(utils.RevertBytes(uint64(clh.config.DiskRateLimiterBwMaxRate/8))),
+		int64(utils.RevertBytes(uint64(clh.config.DiskRateLimiterBwOneTimeBurst/8))),
+		clh.config.DiskRateLimiterOpsMaxRate,
+		clh.config.DiskRateLimiterOpsOneTimeBurst)
+}
+
 func (clh *cloudHypervisor) addNet(e Endpoint) error {
 	clh.Logger().WithField("endpoint-type", e).Debugf("Adding Endpoint of type %v", e)
 
@@ -1325,9 +1382,15 @@ func (clh *cloudHypervisor) addNet(e Endpoint) error {
 		"tap": tapPath,
 	}).Info("Adding Net")
 
+	netRateLimiterConfig := clh.getNetRateLimiterConfig()
+
 	net := chclient.NewNetConfig()
 	net.Mac = &mac
 	net.Tap = &tapPath
+	if netRateLimiterConfig != nil {
+		net.SetRateLimiterConfig(*netRateLimiterConfig)
+	}
+
 	if clh.vmconfig.Net != nil {
 		*clh.vmconfig.Net = append(*clh.vmconfig.Net, *net)
 	} else {
@@ -1437,5 +1500,5 @@ func (clh *cloudHypervisor) vmInfo() (chclient.VmInfo, error) {
 }
 
 func (clh *cloudHypervisor) IsRateLimiterBuiltin() bool {
-	return false
+	return true
 }

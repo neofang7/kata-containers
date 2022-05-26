@@ -410,12 +410,10 @@ func TestGetShmSizeBindMounted(t *testing.T) {
 		t.Skip("Test disabled as requires root privileges")
 	}
 
-	dir, err := os.MkdirTemp("", "")
-	assert.Nil(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	shmPath := filepath.Join(dir, "shm")
-	err = os.Mkdir(shmPath, 0700)
+	err := os.Mkdir(shmPath, 0700)
 	assert.Nil(t, err)
 
 	size := 8192
@@ -473,15 +471,13 @@ func TestMain(m *testing.M) {
 func TestAddAssetAnnotations(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, err := os.MkdirTemp("", "")
-	assert.NoError(err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Create a pretend asset file
 	// (required since the existence of binary asset annotations is verified).
 	fakeAssetFile := filepath.Join(tmpdir, "fake-binary")
 
-	err = os.WriteFile(fakeAssetFile, []byte(""), fileMode)
+	err := os.WriteFile(fakeAssetFile, []byte(""), fileMode)
 	assert.NoError(err)
 
 	expectedAnnotations := map[string]string{
@@ -674,6 +670,7 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.PCIeRootPort] = "2"
 	ocispec.Annotations[vcAnnotations.IOMMUPlatform] = "true"
 	ocispec.Annotations[vcAnnotations.SGXEPC] = "64Mi"
+	ocispec.Annotations[vcAnnotations.UseLegacySerial] = "true"
 	// 10Mbit
 	ocispec.Annotations[vcAnnotations.RxRateLimiterMaxRate] = "10000000"
 	ocispec.Annotations[vcAnnotations.TxRateLimiterMaxRate] = "10000000"
@@ -710,6 +707,7 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	assert.Equal(config.HypervisorConfig.PCIeRootPort, uint32(2))
 	assert.Equal(config.HypervisorConfig.IOMMUPlatform, true)
 	assert.Equal(config.HypervisorConfig.SGXEPCSize, int64(67108864))
+	assert.Equal(config.HypervisorConfig.LegacySerial, true)
 	assert.Equal(config.HypervisorConfig.RxRateLimiterMaxRate, uint64(10000000))
 	assert.Equal(config.HypervisorConfig.TxRateLimiterMaxRate, uint64(10000000))
 

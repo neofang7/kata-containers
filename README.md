@@ -118,6 +118,7 @@ The table below lists the core parts of the project:
 | [runtime](src/runtime) | core | Main component run by a container manager and providing a containerd shimv2 runtime implementation. |
 | [agent](src/agent) | core | Management process running inside the virtual machine / POD that sets up the container environment. |
 | [documentation](docs) | documentation | Documentation common to all components (such as design and install documentation). |
+| [libraries](src/libs) | core | Library crates shared by multiple Kata Container components or published to [`crates.io`](https://crates.io/index.html) |
 | [tests](https://github.com/kata-containers/tests) | tests | Excludes unit tests which live with the main code. |
 
 ### Additional components
@@ -131,6 +132,7 @@ The table below lists the remaining parts of the project:
 | [osbuilder](tools/osbuilder) | infrastructure | Tool to create "mini O/S" rootfs and initrd images and kernel for the hypervisor. |
 | [`agent-ctl`](src/tools/agent-ctl) | utility | Tool that provides low-level access for testing the agent. |
 | [`trace-forwarder`](src/tools/trace-forwarder) | utility | Agent tracing helper. |
+| [`runk`](src/tools/runk) | utility | Standard OCI container runtime based on the agent. |
 | [`ci`](https://github.com/kata-containers/ci) | CI | Continuous Integration configuration files and scripts. |
 | [`katacontainers.io`](https://github.com/kata-containers/www.katacontainers.io) | Source for the [`katacontainers.io`](https://www.katacontainers.io) site. |
 

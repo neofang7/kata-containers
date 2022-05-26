@@ -76,3 +76,8 @@ lto = true
 
 [features]
 seccomp = ["rustjail/seccomp"]
+standard-oci-runtime = ["rustjail/standard-oci-runtime"]
+
+[[bin]]
+name = "kata-agent"
+path = "src/main.rs"

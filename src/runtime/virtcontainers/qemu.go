@@ -38,8 +38,8 @@ import (
 	pkgUtils "github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/uuid"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/drivers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 )
 
@@ -129,6 +129,8 @@ const (
 	fallbackFileBackedMemDir = "/dev/shm"
 
 	qemuStopSandboxTimeoutSecs = 15
+
+	qomPathPrefix = "/machine/peripheral/"
 )
 
 // agnostic list of kernel parameters
@@ -499,7 +501,6 @@ func (q *qemu) createVirtiofsDaemon(sharedPath string) (VirtiofsDaemon, error) {
 		sourcePath: sharedPath,
 		socketPath: virtiofsdSocketPath,
 		extraArgs:  q.config.VirtioFSExtraArgs,
-		debug:      q.config.Debug,
 		cache:      q.config.VirtioFSCache,
 	}, nil
 }
@@ -548,13 +549,6 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 	initrdPath, err := q.config.InitrdAssetPath()
 	if err != nil {
 		return err
-	}
-
-	// Breaks hypervisor abstration Has Kata Specific logic
-	kernel := govmmQemu.Kernel{
-		Path:       kernelPath,
-		InitrdPath: initrdPath,
-		Params:     q.kernelParameters(),
 	}
 
 	incoming := q.setupTemplate(&knobs, &memory)
@@ -626,6 +620,14 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 	qemuPath, err := q.qemuPath()
 	if err != nil {
 		return err
+	}
+
+	// Breaks hypervisor abstraction has Kata Specific logic
+	kernel := govmmQemu.Kernel{
+		Path:       kernelPath,
+		InitrdPath: initrdPath,
+		// some devices configuration may also change kernel params, make sure this is called afterwards
+		Params: q.kernelParameters(),
 	}
 
 	qemuConfig := govmmQemu.Config{
@@ -758,7 +760,7 @@ func (q *qemu) setupVirtioMem(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// backend memory size must be multiple of 2Mib
+	// backend memory size must be multiple of 4Mib
 	sizeMB := (int(maxMem) - int(q.config.MemorySize)) >> 2 << 2
 
 	share, target, memoryBack, err := q.getMemArgs()
@@ -783,7 +785,6 @@ func (q *qemu) setupVirtioMem(ctx context.Context) error {
 
 	err = q.qmpMonitorCh.qmp.ExecMemdevAdd(q.qmpMonitorCh.ctx, memoryBack, "virtiomem", target, sizeMB, share, "virtio-mem-pci", "virtiomem0", addr, bridge.ID)
 	if err == nil {
-		q.config.VirtioMem = true
 		q.Logger().Infof("Setup %dMB virtio-mem-pci success", sizeMB)
 	} else {
 		help := ""
@@ -796,7 +797,7 @@ func (q *qemu) setupVirtioMem(ctx context.Context) error {
 	return err
 }
 
-// startSandbox will start the Sandbox's VM.
+// StartVM will start the Sandbox's VM.
 func (q *qemu) StartVM(ctx context.Context, timeout int) error {
 	span, ctx := katatrace.Trace(ctx, q.Logger(), "StartVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
@@ -968,7 +969,7 @@ func (q *qemu) waitVM(ctx context.Context, timeout int) error {
 	return nil
 }
 
-// stopSandbox will stop the Sandbox's VM.
+// StopVM will stop the Sandbox's VM.
 func (q *qemu) StopVM(ctx context.Context, waitOnly bool) error {
 	span, _ := katatrace.Trace(ctx, q.Logger(), "StopVM", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
@@ -1327,15 +1328,15 @@ func (q *qemu) hotplugAddBlockDevice(ctx context.Context, drive *config.BlockDri
 			}
 		}()
 
-		bridgeSlot, err := vcTypes.PciSlotFromInt(bridge.Addr)
+		bridgeSlot, err := types.PciSlotFromInt(bridge.Addr)
 		if err != nil {
 			return err
 		}
-		devSlot, err := vcTypes.PciSlotFromString(addr)
+		devSlot, err := types.PciSlotFromString(addr)
 		if err != nil {
 			return err
 		}
-		drive.PCIPath, err = vcTypes.PciPathFromSlots(bridgeSlot, devSlot)
+		drive.PCIPath, err = types.PciPathFromSlots(bridgeSlot, devSlot)
 		if err != nil {
 			return err
 		}
@@ -1397,31 +1398,68 @@ func (q *qemu) hotplugAddVhostUserBlkDevice(ctx context.Context, vAttr *config.V
 	}()
 
 	driver := "vhost-user-blk-pci"
-	addr, bridge, err := q.arch.addDeviceToBridge(ctx, vAttr.DevID, types.PCI)
-	if err != nil {
-		return err
-	}
 
-	defer func() {
-		if err != nil {
-			q.arch.removeDeviceFromBridge(vAttr.DevID)
+	machineType := q.HypervisorConfig().HypervisorMachineType
+
+	switch machineType {
+	case QemuVirt:
+		if q.state.PCIeRootPort <= 0 {
+			return fmt.Errorf("Vhost-user-blk device is a PCIe device if machine type is virt. Need to add the PCIe Root Port by setting the pcie_root_port parameter in the configuration for virt")
 		}
-	}()
 
-	bridgeSlot, err := vcTypes.PciSlotFromInt(bridge.Addr)
-	if err != nil {
-		return err
-	}
-	devSlot, err := vcTypes.PciSlotFromString(addr)
-	if err != nil {
-		return err
-	}
-	vAttr.PCIPath, err = vcTypes.PciPathFromSlots(bridgeSlot, devSlot)
+		//The addr of a dev is corresponding with device:function for PCIe in qemu which starting from 0
+		//Since the dev is the first and only one on this bus(root port), it should be 0.
+		addr := "00"
 
-	if err = q.qmpMonitorCh.qmp.ExecutePCIVhostUserDevAdd(q.qmpMonitorCh.ctx, driver, devID, vAttr.DevID, addr, bridge.ID); err != nil {
-		return err
-	}
+		bridgeId := fmt.Sprintf("%s%d", pcieRootPortPrefix, len(drivers.AllPCIeDevs))
+		drivers.AllPCIeDevs[devID] = true
 
+		bridgeQomPath := fmt.Sprintf("%s%s", qomPathPrefix, bridgeId)
+		bridgeSlot, err := q.qomGetSlot(bridgeQomPath)
+		if err != nil {
+			return err
+		}
+
+		devSlot, err := types.PciSlotFromString(addr)
+		if err != nil {
+			return err
+		}
+
+		vAttr.PCIPath, err = types.PciPathFromSlots(bridgeSlot, devSlot)
+		if err != nil {
+			return err
+		}
+
+		if err = q.qmpMonitorCh.qmp.ExecutePCIVhostUserDevAdd(q.qmpMonitorCh.ctx, driver, devID, vAttr.DevID, addr, bridgeId); err != nil {
+			return err
+		}
+
+	default:
+		addr, bridge, err := q.arch.addDeviceToBridge(ctx, vAttr.DevID, types.PCI)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil {
+				q.arch.removeDeviceFromBridge(vAttr.DevID)
+			}
+		}()
+
+		bridgeSlot, err := types.PciSlotFromInt(bridge.Addr)
+		if err != nil {
+			return err
+		}
+
+		devSlot, err := types.PciSlotFromString(addr)
+		if err != nil {
+			return err
+		}
+		vAttr.PCIPath, err = types.PciPathFromSlots(bridgeSlot, devSlot)
+
+		if err = q.qmpMonitorCh.qmp.ExecutePCIVhostUserDevAdd(q.qmpMonitorCh.ctx, driver, devID, vAttr.DevID, addr, bridge.ID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1463,8 +1501,13 @@ func (q *qemu) hotplugVhostUserDevice(ctx context.Context, vAttr *config.VhostUs
 			return fmt.Errorf("Incorrect vhost-user device type found")
 		}
 	} else {
-		if err := q.arch.removeDeviceFromBridge(vAttr.DevID); err != nil {
-			return err
+
+		machineType := q.HypervisorConfig().HypervisorMachineType
+
+		if machineType != QemuVirt {
+			if err := q.arch.removeDeviceFromBridge(vAttr.DevID); err != nil {
+				return err
+			}
 		}
 
 		if err := q.qmpMonitorCh.qmp.ExecuteDeviceDel(q.qmpMonitorCh.ctx, devID); err != nil {
@@ -1476,48 +1519,48 @@ func (q *qemu) hotplugVhostUserDevice(ctx context.Context, vAttr *config.VhostUs
 }
 
 // Query QMP to find the PCI slot of a device, given its QOM path or ID
-func (q *qemu) qomGetSlot(qomPath string) (vcTypes.PciSlot, error) {
+func (q *qemu) qomGetSlot(qomPath string) (types.PciSlot, error) {
 	addr, err := q.qmpMonitorCh.qmp.ExecQomGet(q.qmpMonitorCh.ctx, qomPath, "addr")
 	if err != nil {
-		return vcTypes.PciSlot{}, err
+		return types.PciSlot{}, err
 	}
 	addrf, ok := addr.(float64)
 	// XXX going via float makes no real sense, but that's how
 	// JSON works, and we'll get away with it for the small values
 	// we have here
 	if !ok {
-		return vcTypes.PciSlot{}, fmt.Errorf("addr QOM property of %q is %T not a number", qomPath, addr)
+		return types.PciSlot{}, fmt.Errorf("addr QOM property of %q is %T not a number", qomPath, addr)
 	}
 	addri := int(addrf)
 
 	slotNum, funcNum := addri>>3, addri&0x7
 	if funcNum != 0 {
-		return vcTypes.PciSlot{}, fmt.Errorf("Unexpected non-zero PCI function (%02x.%1x) on %q",
+		return types.PciSlot{}, fmt.Errorf("Unexpected non-zero PCI function (%02x.%1x) on %q",
 			slotNum, funcNum, qomPath)
 	}
 
-	return vcTypes.PciSlotFromInt(slotNum)
+	return types.PciSlotFromInt(slotNum)
 }
 
 // Query QMP to find a device's PCI path given its QOM path or ID
-func (q *qemu) qomGetPciPath(qemuID string) (vcTypes.PciPath, error) {
+func (q *qemu) qomGetPciPath(qemuID string) (types.PciPath, error) {
 	// XXX: For now we assume there's exactly one bridge, since
 	// that's always how we configure qemu from Kata for now.  It
 	// would be good to generalize this to different PCI
 	// topologies
 	devSlot, err := q.qomGetSlot(qemuID)
 	if err != nil {
-		return vcTypes.PciPath{}, err
+		return types.PciPath{}, err
 	}
 
 	busq, err := q.qmpMonitorCh.qmp.ExecQomGet(q.qmpMonitorCh.ctx, qemuID, "parent_bus")
 	if err != nil {
-		return vcTypes.PciPath{}, err
+		return types.PciPath{}, err
 	}
 
 	bus, ok := busq.(string)
 	if !ok {
-		return vcTypes.PciPath{}, fmt.Errorf("parent_bus QOM property of %s is %t not a string", qemuID, busq)
+		return types.PciPath{}, fmt.Errorf("parent_bus QOM property of %s is %t not a string", qemuID, busq)
 	}
 
 	// `bus` is the QOM path of the QOM bus object, but we need
@@ -1526,16 +1569,16 @@ func (q *qemu) qomGetPciPath(qemuID string) (vcTypes.PciPath, error) {
 	// path component.
 	idx := strings.LastIndex(bus, "/")
 	if idx == -1 {
-		return vcTypes.PciPath{}, fmt.Errorf("Bus has unexpected QOM path %s", bus)
+		return types.PciPath{}, fmt.Errorf("Bus has unexpected QOM path %s", bus)
 	}
 	bridge := bus[:idx]
 
 	bridgeSlot, err := q.qomGetSlot(bridge)
 	if err != nil {
-		return vcTypes.PciPath{}, err
+		return types.PciPath{}, err
 	}
 
-	return vcTypes.PciPathFromSlots(bridgeSlot, devSlot)
+	return types.PciPathFromSlots(bridgeSlot, devSlot)
 }
 
 func (q *qemu) hotplugVFIODevice(ctx context.Context, device *config.VFIODev, op Operation) (err error) {
@@ -1696,15 +1739,15 @@ func (q *qemu) hotplugNetDevice(ctx context.Context, endpoint Endpoint, op Opera
 			}
 		}()
 
-		bridgeSlot, err := vcTypes.PciSlotFromInt(bridge.Addr)
+		bridgeSlot, err := types.PciSlotFromInt(bridge.Addr)
 		if err != nil {
 			return err
 		}
-		devSlot, err := vcTypes.PciSlotFromString(addr)
+		devSlot, err := types.PciSlotFromString(addr)
 		if err != nil {
 			return err
 		}
-		pciPath, err := vcTypes.PciPathFromSlots(bridgeSlot, devSlot)
+		pciPath, err := types.PciPathFromSlots(bridgeSlot, devSlot)
 		endpoint.SetPciPath(pciPath)
 
 		var machine govmmQemu.Machine
@@ -1841,7 +1884,7 @@ func (q *qemu) hotplugAddCPUs(amount uint32) (uint32, error) {
 		threadID := fmt.Sprintf("%d", hc.Properties.Thread)
 
 		// If CPU type is IBM pSeries, Z or arm virt, we do not set socketID and threadID
-		if machine.Type == "pseries" || machine.Type == "s390-ccw-virtio" || machine.Type == "virt" {
+		if machine.Type == "pseries" || machine.Type == QemuCCWVirtio || machine.Type == "virt" {
 			socketID = ""
 			threadID = ""
 			dieID = ""
@@ -1996,7 +2039,7 @@ func (q *qemu) ResumeVM(ctx context.Context) error {
 	return q.togglePauseSandbox(ctx, false)
 }
 
-// addDevice will add extra devices to Qemu command line.
+// AddDevice will add extra devices to Qemu command line.
 func (q *qemu) AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error {
 	var err error
 	span, _ := katatrace.Trace(ctx, q.Logger(), "AddDevice", qemuTracingTags)
@@ -2055,8 +2098,8 @@ func (q *qemu) AddDevice(ctx context.Context, devInfo interface{}, devType Devic
 	return err
 }
 
-// getSandboxConsole builds the path of the console where we can read
-// logs coming from the sandbox.
+// GetVMConsole builds the path of the console where we can read logs coming
+// from the sandbox.
 func (q *qemu) GetVMConsole(ctx context.Context, id string) (string, string, error) {
 	span, _ := katatrace.Trace(ctx, q.Logger(), "GetVMConsole", qemuTracingTags, map[string]string{"sandbox_id": q.id})
 	defer span.End()
@@ -2129,7 +2172,7 @@ func (q *qemu) Disconnect(ctx context.Context) {
 	q.qmpShutdown()
 }
 
-// resizeMemory get a request to update the VM memory to reqMemMB
+// ResizeMemory gets a request to update the VM memory to reqMemMB
 // Memory update is managed with two approaches
 // Add memory to VM:
 // When memory is required to be added we hotplug memory
@@ -2317,7 +2360,7 @@ func genericAppendPCIeRootPort(devices []govmmQemu.Device, number uint32, machin
 		addr          string
 	)
 	switch machineType {
-	case QemuQ35:
+	case QemuQ35, QemuVirt:
 		bus = defaultBridgeBus
 		chassis = "0"
 		multiFunction = false

@@ -250,7 +250,6 @@ generate_qemu_options() {
 	qemu_options+=(size:--disable-auth-pam)
 
 	# Disable unused filesystem support
-	[ "$arch" == x86_64 ] && qemu_options+=(size:--disable-fdt)
 	qemu_options+=(size:--disable-glusterfs)
 	qemu_options+=(size:--disable-libiscsi)
 	qemu_options+=(size:--disable-libnfs)
@@ -303,7 +302,6 @@ generate_qemu_options() {
 		;;
 	esac
 	qemu_options+=(size:--disable-qom-cast-debug)
-	qemu_options+=(size:--disable-tcmalloc)
 
 	# Disable libudev since it is only needed for qemu-pr-helper and USB,
 	# none of which are used with Kata
@@ -319,12 +317,6 @@ generate_qemu_options() {
 	# Don't build the qemu-io, qemu-nbd and qemu-image tools
 	qemu_options+=(size:--disable-tools)
 
-	# Kata Containers may be configured to use the virtiofs daemon.
-	#
-	# But since QEMU 5.2 the daemon is built as part of the tools set
-	# (disabled with --disable-tools) thus it needs to be explicitely
-	# enabled.
-	qemu_options+=(functionality:--enable-virtiofsd)
 	qemu_options+=(functionality:--enable-virtfs)
 
 	# Don't build linux-user bsd-user

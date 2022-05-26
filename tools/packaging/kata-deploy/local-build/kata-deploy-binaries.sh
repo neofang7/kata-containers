@@ -8,6 +8,7 @@
 set -o errexit
 set -o nounset
 set -o pipefail
+set -o errtrace
 
 readonly project="kata-containers"
 
@@ -25,6 +26,7 @@ readonly firecracker_builder="${static_build_dir}/firecracker/build-static-firec
 readonly kernel_builder="${static_build_dir}/kernel/build.sh"
 readonly qemu_builder="${static_build_dir}/qemu/build-static-qemu.sh"
 readonly shimv2_builder="${static_build_dir}/shim-v2/build.sh"
+readonly virtiofsd_builder="${static_build_dir}/virtiofsd/build-static-virtiofsd.sh"
 
 readonly rootfs_builder="${repo_root_dir}/tools/packaging/guest-image/build_image.sh"
 
@@ -64,6 +66,7 @@ version: The kata version that will be use to create the tarball
 options:
 
 -h|--help      	      : Show this help
+-s             	      : Silent mode (produce output in case of failure only)
 --build=<asset>       :
 	all
 	cloud-hypervisor
@@ -74,6 +77,7 @@ options:
 	rootfs-image
 	rootfs-initrd
 	shim-v2
+	virtiofsd
 EOF
 
 	exit "${return_code}"
@@ -138,6 +142,15 @@ install_clh() {
 	sudo install -D --owner root --group root --mode 0744 cloud-hypervisor/cloud-hypervisor "${destdir}/opt/kata/bin/cloud-hypervisor"
 }
 
+# Install static virtiofsd asset
+install_virtiofsd() {
+	info "build static virtiofsd"
+	"${virtiofsd_builder}"
+	info "Install static virtiofsd"
+	mkdir -p "${destdir}/opt/kata/libexec/"
+	sudo install -D --owner root --group root --mode 0744 virtiofsd/virtiofsd "${destdir}/opt/kata/libexec/virtiofsd"
+}
+
 #Install all components that are not assets
 install_shimv2() {
 	GO_VERSION="$(yq r ${versions_yaml} languages.golang.meta.newest-version)"
@@ -164,6 +177,7 @@ handle_build() {
 		install_kernel
 		install_qemu
 		install_shimv2
+		install_virtiofsd
 		;;
 
 	cloud-hypervisor) install_clh ;;
@@ -182,6 +196,8 @@ handle_build() {
 
 	shim-v2) install_shimv2 ;;
 
+	virtiofsd) install_virtiofsd ;;
+
 	*)
 		die "Invalid build target ${build_target}"
 		;;
@@ -193,6 +209,18 @@ handle_build() {
 		sudo tar cvfJ "${tarball_name}" "."
 	)
 	tar tvf "${tarball_name}"
+}
+
+silent_mode_error_trap() {
+	local stdout="$1"
+	local stderr="$2"
+	local t="$3"
+	local log_file="$4"
+	exec 1>&${stdout}
+	exec 2>&${stderr}
+	error "Failed to build: $t, logs:"
+	cat "${log_file}"
+	exit 1
 }
 
 main() {
@@ -207,6 +235,7 @@ main() {
 		rootfs-image
 		rootfs-initrd
 		shim-v2
+		virtiofsd
 	)
 	silent=false
 	while getopts "hs-:" opt; do
@@ -247,11 +276,15 @@ main() {
 		(
 			cd "${builddir}"
 			if [ "${silent}" == true ]; then
-				if ! handle_build "${t}" &>"$log_file"; then
-					error "Failed to build: $t, logs:"
-					cat "${log_file}"
-					exit 1
-				fi
+				local stdout
+				local stderr
+				# Save stdout and stderr, to be restored
+				# by silent_mode_error_trap() in case of
+				# build failure.
+				exec {stdout}>&1
+				exec {stderr}>&2
+				trap "silent_mode_error_trap $stdout $stderr $t \"$log_file\"" ERR
+				handle_build "${t}" &>"$log_file"
 			else
 				handle_build "${t}"
 			fi

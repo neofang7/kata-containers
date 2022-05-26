@@ -19,6 +19,7 @@ use ttrpc::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use cgroups::freezer::FreezerState;
 use oci::{LinuxNamespace, Root, Spec};
 use protobuf::{Message, RepeatedField, SingularPtrField};
 use protocols::agent::{
@@ -39,12 +40,10 @@ use rustjail::specconv::CreateOpts;
 
 use nix::errno::Errno;
 use nix::mount::MsFlags;
-use nix::sys::signal::Signal;
-use nix::sys::stat;
+use nix::sys::{stat, statfs};
 use nix::unistd::{self, Pid};
+use rustjail::cgroups::Manager;
 use rustjail::process::ProcessOperations;
-
-use sysinfo::{DiskExt, System, SystemExt};
 
 use crate::device::{
     add_devices, get_virtio_blk_pci_device_name, update_device_cgroup, update_env_pci,
@@ -69,9 +68,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing::instrument;
 
 use libc::{self, c_char, c_ushort, pid_t, winsize, TIOCSWINSZ};
-use std::convert::TryFrom;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -85,7 +82,10 @@ use std::path::PathBuf;
 const CONTAINER_BASE: &str = "/run/kata-containers";
 const MODPROBE_PATH: &str = "/sbin/modprobe";
 
+const ERR_CANNOT_GET_WRITER: &str = "Cannot get writer";
 const ERR_INVALID_BLOCK_SIZE: &str = "Invalid block size";
+const ERR_NO_LINUX_FIELD: &str = "Spec does not contain linux field";
+const ERR_NO_SANDBOX_PIDNS: &str = "Sandbox does not have sandbox_pidns";
 
 // Convenience macro to obtain the scope logger
 macro_rules! sl {
@@ -391,7 +391,6 @@ impl AgentService {
         let cid = req.container_id.clone();
         let eid = req.exec_id.clone();
         let s = self.sandbox.clone();
-        let mut sandbox = s.lock().await;
 
         info!(
             sl!(),
@@ -400,25 +399,92 @@ impl AgentService {
             "exec-id" => eid.clone(),
         );
 
-        let p = sandbox.find_container_process(cid.as_str(), eid.as_str())?;
-
-        let mut signal = Signal::try_from(req.signal as i32).map_err(|e| {
-            anyhow!(e).context(format!(
-                "failed to convert {:?} to signal (container-id: {}, exec-id: {})",
-                req.signal, cid, eid
-            ))
-        })?;
-
-        // For container initProcess, if it hasn't installed handler for "SIGTERM" signal,
-        // it will ignore the "SIGTERM" signal sent to it, thus send it "SIGKILL" signal
-        // instead of "SIGTERM" to terminate it.
-        if p.init && signal == Signal::SIGTERM && !is_signal_handled(p.pid, req.signal) {
-            signal = Signal::SIGKILL;
+        let mut sig: libc::c_int = req.signal as libc::c_int;
+        {
+            let mut sandbox = s.lock().await;
+            let p = sandbox.find_container_process(cid.as_str(), eid.as_str())?;
+            // For container initProcess, if it hasn't installed handler for "SIGTERM" signal,
+            // it will ignore the "SIGTERM" signal sent to it, thus send it "SIGKILL" signal
+            // instead of "SIGTERM" to terminate it.
+            let proc_status_file = format!("/proc/{}/status", p.pid);
+            if p.init && sig == libc::SIGTERM && !is_signal_handled(&proc_status_file, sig as u32) {
+                sig = libc::SIGKILL;
+            }
+            p.signal(sig)?;
         }
 
-        p.signal(signal)?;
+        if eid.is_empty() {
+            // eid is empty, signal all the remaining processes in the container cgroup
+            info!(
+                sl!(),
+                "signal all the remaining processes";
+                "container-id" => cid.clone(),
+                "exec-id" => eid.clone(),
+            );
 
+            if let Err(err) = self.freeze_cgroup(&cid, FreezerState::Frozen).await {
+                warn!(
+                    sl!(),
+                    "freeze cgroup failed";
+                    "container-id" => cid.clone(),
+                    "exec-id" => eid.clone(),
+                    "error" => format!("{:?}", err),
+                );
+            }
+
+            let pids = self.get_pids(&cid).await?;
+            for pid in pids.iter() {
+                let res = unsafe { libc::kill(*pid, sig) };
+                if let Err(err) = Errno::result(res).map(drop) {
+                    warn!(
+                        sl!(),
+                        "signal failed";
+                        "container-id" => cid.clone(),
+                        "exec-id" => eid.clone(),
+                        "pid" => pid,
+                        "error" => format!("{:?}", err),
+                    );
+                }
+            }
+            if let Err(err) = self.freeze_cgroup(&cid, FreezerState::Thawed).await {
+                warn!(
+                    sl!(),
+                    "unfreeze cgroup failed";
+                    "container-id" => cid.clone(),
+                    "exec-id" => eid.clone(),
+                    "error" => format!("{:?}", err),
+                );
+            }
+        }
         Ok(())
+    }
+
+    async fn freeze_cgroup(&self, cid: &str, state: FreezerState) -> Result<()> {
+        let s = self.sandbox.clone();
+        let mut sandbox = s.lock().await;
+        let ctr = sandbox
+            .get_container(cid)
+            .ok_or_else(|| anyhow!("Invalid container id {}", cid))?;
+        let cm = ctr
+            .cgroup_manager
+            .as_ref()
+            .ok_or_else(|| anyhow!("cgroup manager not exist"))?;
+        cm.freeze(state)?;
+        Ok(())
+    }
+
+    async fn get_pids(&self, cid: &str) -> Result<Vec<i32>> {
+        let s = self.sandbox.clone();
+        let mut sandbox = s.lock().await;
+        let ctr = sandbox
+            .get_container(cid)
+            .ok_or_else(|| anyhow!("Invalid container id {}", cid))?;
+        let cm = ctr
+            .cgroup_manager
+            .as_ref()
+            .ok_or_else(|| anyhow!("cgroup manager not exist"))?;
+        let pids = cm.get_pids()?;
+        Ok(pids)
     }
 
     #[instrument]
@@ -512,7 +578,7 @@ impl AgentService {
             }
         };
 
-        let writer = writer.ok_or_else(|| anyhow!("cannot get writer"))?;
+        let writer = writer.ok_or_else(|| anyhow!(ERR_CANNOT_GET_WRITER))?;
         writer.lock().await.write_all(req.data.as_slice()).await?;
 
         let mut resp = WriteStreamResponse::new();
@@ -1399,20 +1465,12 @@ fn get_memory_info(
 fn get_volume_capacity_stats(path: &str) -> Result<VolumeUsage> {
     let mut usage = VolumeUsage::new();
 
-    let s = System::new();
-    for disk in s.disks() {
-        if let Some(v) = disk.name().to_str() {
-            if v.to_string().eq(path) {
-                usage.available = disk.available_space();
-                usage.total = disk.total_space();
-                usage.used = usage.total - usage.available;
-                usage.unit = VolumeUsage_Unit::BYTES; // bytes
-                break;
-            }
-        } else {
-            return Err(anyhow!(nix::Error::EINVAL));
-        }
-    }
+    let stat = statfs::statfs(path)?;
+    let block_size = stat.block_size() as u64;
+    usage.total = stat.blocks() * block_size;
+    usage.available = stat.blocks_free() * block_size;
+    usage.used = usage.total - usage.available;
+    usage.unit = VolumeUsage_Unit::BYTES;
 
     Ok(usage)
 }
@@ -1420,20 +1478,11 @@ fn get_volume_capacity_stats(path: &str) -> Result<VolumeUsage> {
 fn get_volume_inode_stats(path: &str) -> Result<VolumeUsage> {
     let mut usage = VolumeUsage::new();
 
-    let s = System::new();
-    for disk in s.disks() {
-        if let Some(v) = disk.name().to_str() {
-            if v.to_string().eq(path) {
-                let meta = fs::metadata(disk.mount_point())?;
-                let inode = meta.ino();
-                usage.used = inode;
-                usage.unit = VolumeUsage_Unit::INODES;
-                break;
-            }
-        } else {
-            return Err(anyhow!(nix::Error::EINVAL));
-        }
-    }
+    let stat = statfs::statfs(path)?;
+    usage.total = stat.files();
+    usage.available = stat.files_free();
+    usage.used = usage.total - usage.available;
+    usage.unit = VolumeUsage_Unit::INODES;
 
     Ok(usage)
 }
@@ -1522,7 +1571,7 @@ fn update_container_namespaces(
     let linux = spec
         .linux
         .as_mut()
-        .ok_or_else(|| anyhow!("Spec didn't container linux field"))?;
+        .ok_or_else(|| anyhow!(ERR_NO_LINUX_FIELD))?;
 
     let namespaces = linux.namespaces.as_mut_slice();
     for namespace in namespaces.iter_mut() {
@@ -1549,7 +1598,7 @@ fn update_container_namespaces(
         if let Some(ref pidns) = &sandbox.sandbox_pidns {
             pid_ns.path = String::from(pidns.path.as_str());
         } else {
-            return Err(anyhow!("failed to get sandbox pidns"));
+            return Err(anyhow!(ERR_NO_SANDBOX_PIDNS));
         }
     }
 
@@ -1569,21 +1618,33 @@ fn append_guest_hooks(s: &Sandbox, oci: &mut Spec) -> Result<()> {
     Ok(())
 }
 
-// Check is the container process installed the
+// Check if the container process installed the
 // handler for specific signal.
-fn is_signal_handled(pid: pid_t, signum: u32) -> bool {
-    let sig_mask: u64 = 1u64 << (signum - 1);
-    let file_name = format!("/proc/{}/status", pid);
+fn is_signal_handled(proc_status_file: &str, signum: u32) -> bool {
+    let shift_count: u64 = if signum == 0 {
+        // signum 0 is used to check for process liveness.
+        // Since that signal is not part of the mask in the file, we only need
+        // to know if the file (and therefore) process exists to handle
+        // that signal.
+        return fs::metadata(proc_status_file).is_ok();
+    } else if signum > 64 {
+        // Ensure invalid signum won't break bit shift logic
+        warn!(sl!(), "received invalid signum {}", signum);
+        return false;
+    } else {
+        (signum - 1).into()
+    };
 
     // Open the file in read-only mode (ignoring errors).
-    let file = match File::open(&file_name) {
+    let file = match File::open(proc_status_file) {
         Ok(f) => f,
         Err(_) => {
-            warn!(sl!(), "failed to open file {}\n", file_name);
+            warn!(sl!(), "failed to open file {}", proc_status_file);
             return false;
         }
     };
 
+    let sig_mask: u64 = 1 << shift_count;
     let reader = BufReader::new(file);
 
     // Read the file line by line using the lines() iterator from std::io::BufRead.
@@ -1591,21 +1652,21 @@ fn is_signal_handled(pid: pid_t, signum: u32) -> bool {
         let line = match line {
             Ok(l) => l,
             Err(_) => {
-                warn!(sl!(), "failed to read file {}\n", file_name);
+                warn!(sl!(), "failed to read file {}", proc_status_file);
                 return false;
             }
         };
         if line.starts_with("SigCgt:") {
             let mask_vec: Vec<&str> = line.split(':').collect();
             if mask_vec.len() != 2 {
-                warn!(sl!(), "parse the SigCgt field failed\n");
+                warn!(sl!(), "parse the SigCgt field failed");
                 return false;
             }
-            let sig_cgt_str = mask_vec[1];
+            let sig_cgt_str = mask_vec[1].trim();
             let sig_cgt_mask = match u64::from_str_radix(sig_cgt_str, 16) {
                 Ok(h) => h,
                 Err(_) => {
-                    warn!(sl!(), "failed to parse the str {} to hex\n", sig_cgt_str);
+                    warn!(sl!(), "failed to parse the str {} to hex", sig_cgt_str);
                     return false;
                 }
             };
@@ -1721,7 +1782,7 @@ async fn do_add_swap(sandbox: &Arc<Mutex<Sandbox>>, req: &AddSwapRequest) -> Res
 // - config.json at /<CONTAINER_BASE>/<cid>/config.json
 // - container rootfs bind mounted at /<CONTAINER_BASE>/<cid>/rootfs
 // - modify container spec root to point to /<CONTAINER_BASE>/<cid>/rootfs
-fn setup_bundle(cid: &str, spec: &mut Spec) -> Result<PathBuf> {
+pub fn setup_bundle(cid: &str, spec: &mut Spec) -> Result<PathBuf> {
     let spec_root = if let Some(sr) = &spec.root {
         sr
     } else {
@@ -1813,36 +1874,14 @@ fn load_kernel_module(module: &protocols::agent::KernelModule) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::agent_ttrpc::AgentService as _;
-    use oci::{Hook, Hooks};
-    use tempfile::tempdir;
+    use crate::{
+        assert_result, namespace::Namespace, protocols::agent_ttrpc::AgentService as _,
+        skip_if_not_root,
+    };
+    use nix::mount;
+    use oci::{Hook, Hooks, Linux, LinuxNamespace};
+    use tempfile::{tempdir, TempDir};
     use ttrpc::{r#async::TtrpcContext, MessageHeader};
-
-    // Parameters:
-    //
-    // 1: expected Result
-    // 2: actual Result
-    // 3: string used to identify the test on error
-    macro_rules! assert_result {
-        ($expected_result:expr, $actual_result:expr, $msg:expr) => {
-            if $expected_result.is_ok() {
-                let expected_level = $expected_result.as_ref().unwrap();
-                let actual_level = $actual_result.unwrap();
-                assert!(*expected_level == actual_level, "{}", $msg);
-            } else {
-                let expected_error = $expected_result.as_ref().unwrap_err();
-                let expected_error_msg = format!("{:?}", expected_error);
-
-                if let Err(actual_error) = $actual_result {
-                    let actual_error_msg = format!("{:?}", actual_error);
-
-                    assert!(expected_error_msg == actual_error_msg, "{}", $msg);
-                } else {
-                    assert!(expected_error_msg == "expected error, got OK", "{}", $msg);
-                }
-            }
-        };
-    }
 
     fn mk_ttrpc_context() -> TtrpcContext {
         TtrpcContext {
@@ -1851,6 +1890,44 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             timeout_nano: 0,
         }
+    }
+
+    fn create_dummy_opts() -> CreateOpts {
+        let root = Root {
+            path: String::from("/"),
+            ..Default::default()
+        };
+
+        let spec = Spec {
+            linux: Some(oci::Linux::default()),
+            root: Some(root),
+            ..Default::default()
+        };
+
+        CreateOpts {
+            cgroup_name: "".to_string(),
+            use_systemd_cgroup: false,
+            no_pivot_root: false,
+            no_new_keyring: false,
+            spec: Some(spec),
+            rootless_euid: false,
+            rootless_cgroup: false,
+        }
+    }
+
+    fn create_linuxcontainer() -> (LinuxContainer, TempDir) {
+        let dir = tempdir().expect("failed to make tempdir");
+
+        (
+            LinuxContainer::new(
+                "some_id",
+                dir.path().join("rootfs").to_str().unwrap(),
+                create_dummy_opts(),
+                &slog_scope::logger(),
+            )
+            .unwrap(),
+            dir,
+        )
     }
 
     #[test]
@@ -1943,6 +2020,282 @@ mod tests {
         let result = agent_service.add_arp_neighbors(&ctx, req).await;
 
         assert!(result.is_err(), "expected add arp neighbors to fail");
+    }
+
+    #[tokio::test]
+    async fn test_do_write_stream() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            create_container: bool,
+            has_fd: bool,
+            has_tty: bool,
+            break_pipe: bool,
+
+            container_id: &'a str,
+            exec_id: &'a str,
+            data: Vec<u8>,
+            result: Result<protocols::agent::WriteStreamResponse>,
+        }
+
+        impl Default for TestData<'_> {
+            fn default() -> Self {
+                TestData {
+                    create_container: true,
+                    has_fd: true,
+                    has_tty: true,
+                    break_pipe: false,
+
+                    container_id: "1",
+                    exec_id: "2",
+                    data: vec![1, 2, 3],
+                    result: Ok(WriteStreamResponse {
+                        len: 3,
+                        ..WriteStreamResponse::default()
+                    }),
+                }
+            }
+        }
+
+        let tests = &[
+            TestData {
+                ..Default::default()
+            },
+            TestData {
+                has_tty: false,
+                ..Default::default()
+            },
+            TestData {
+                break_pipe: true,
+                result: Err(anyhow!(std::io::Error::from_raw_os_error(libc::EPIPE))),
+                ..Default::default()
+            },
+            TestData {
+                create_container: false,
+                result: Err(anyhow!(crate::sandbox::ERR_INVALID_CONTAINER_ID)),
+                ..Default::default()
+            },
+            TestData {
+                container_id: "8181",
+                result: Err(anyhow!(crate::sandbox::ERR_INVALID_CONTAINER_ID)),
+                ..Default::default()
+            },
+            TestData {
+                data: vec![],
+                result: Ok(WriteStreamResponse {
+                    len: 0,
+                    ..WriteStreamResponse::default()
+                }),
+                ..Default::default()
+            },
+            TestData {
+                has_fd: false,
+                result: Err(anyhow!(ERR_CANNOT_GET_WRITER)),
+                ..Default::default()
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d);
+
+            let logger = slog::Logger::root(slog::Discard, o!());
+            let mut sandbox = Sandbox::new(&logger).unwrap();
+
+            let (rfd, wfd) = unistd::pipe().unwrap();
+            if d.break_pipe {
+                unistd::close(rfd).unwrap();
+            }
+
+            if d.create_container {
+                let (mut linux_container, _root) = create_linuxcontainer();
+                let exec_process_id = 2;
+
+                linux_container.id = "1".to_string();
+
+                let mut exec_process = Process::new(
+                    &logger,
+                    &oci::Process::default(),
+                    &exec_process_id.to_string(),
+                    false,
+                    1,
+                )
+                .unwrap();
+
+                let fd = {
+                    if d.has_fd {
+                        Some(wfd)
+                    } else {
+                        None
+                    }
+                };
+
+                if d.has_tty {
+                    exec_process.parent_stdin = None;
+                    exec_process.term_master = fd;
+                } else {
+                    exec_process.parent_stdin = fd;
+                    exec_process.term_master = None;
+                }
+                linux_container
+                    .processes
+                    .insert(exec_process_id, exec_process);
+
+                sandbox.add_container(linux_container);
+            }
+
+            let agent_service = Box::new(AgentService {
+                sandbox: Arc::new(Mutex::new(sandbox)),
+            });
+
+            let result = agent_service
+                .do_write_stream(protocols::agent::WriteStreamRequest {
+                    container_id: d.container_id.to_string(),
+                    exec_id: d.exec_id.to_string(),
+                    data: d.data.clone(),
+                    ..Default::default()
+                })
+                .await;
+
+            if !d.break_pipe {
+                unistd::close(rfd).unwrap();
+            }
+            unistd::close(wfd).unwrap();
+
+            let msg = format!("{}, result: {:?}", msg, result);
+            assert_result!(d.result, result, msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_container_namespaces() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            has_linux_in_spec: bool,
+            sandbox_pidns_path: Option<&'a str>,
+
+            namespaces: Vec<LinuxNamespace>,
+            use_sandbox_pidns: bool,
+            result: Result<()>,
+            expected_namespaces: Vec<LinuxNamespace>,
+        }
+
+        impl Default for TestData<'_> {
+            fn default() -> Self {
+                TestData {
+                    has_linux_in_spec: true,
+                    sandbox_pidns_path: Some("sharedpidns"),
+                    namespaces: vec![
+                        LinuxNamespace {
+                            r#type: NSTYPEIPC.to_string(),
+                            path: "ipcpath".to_string(),
+                        },
+                        LinuxNamespace {
+                            r#type: NSTYPEUTS.to_string(),
+                            path: "utspath".to_string(),
+                        },
+                    ],
+                    use_sandbox_pidns: false,
+                    result: Ok(()),
+                    expected_namespaces: vec![
+                        LinuxNamespace {
+                            r#type: NSTYPEIPC.to_string(),
+                            path: "".to_string(),
+                        },
+                        LinuxNamespace {
+                            r#type: NSTYPEUTS.to_string(),
+                            path: "".to_string(),
+                        },
+                        LinuxNamespace {
+                            r#type: NSTYPEPID.to_string(),
+                            path: "".to_string(),
+                        },
+                    ],
+                }
+            }
+        }
+
+        let tests = &[
+            TestData {
+                ..Default::default()
+            },
+            TestData {
+                use_sandbox_pidns: true,
+                expected_namespaces: vec![
+                    LinuxNamespace {
+                        r#type: NSTYPEIPC.to_string(),
+                        path: "".to_string(),
+                    },
+                    LinuxNamespace {
+                        r#type: NSTYPEUTS.to_string(),
+                        path: "".to_string(),
+                    },
+                    LinuxNamespace {
+                        r#type: NSTYPEPID.to_string(),
+                        path: "sharedpidns".to_string(),
+                    },
+                ],
+                ..Default::default()
+            },
+            TestData {
+                namespaces: vec![],
+                use_sandbox_pidns: true,
+                expected_namespaces: vec![LinuxNamespace {
+                    r#type: NSTYPEPID.to_string(),
+                    path: "sharedpidns".to_string(),
+                }],
+                ..Default::default()
+            },
+            TestData {
+                namespaces: vec![],
+                use_sandbox_pidns: false,
+                expected_namespaces: vec![LinuxNamespace {
+                    r#type: NSTYPEPID.to_string(),
+                    path: "".to_string(),
+                }],
+                ..Default::default()
+            },
+            TestData {
+                namespaces: vec![],
+                sandbox_pidns_path: None,
+                use_sandbox_pidns: true,
+                result: Err(anyhow!(ERR_NO_SANDBOX_PIDNS)),
+                expected_namespaces: vec![],
+                ..Default::default()
+            },
+            TestData {
+                has_linux_in_spec: false,
+                result: Err(anyhow!(ERR_NO_LINUX_FIELD)),
+                ..Default::default()
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d);
+
+            let logger = slog::Logger::root(slog::Discard, o!());
+            let mut sandbox = Sandbox::new(&logger).unwrap();
+            if let Some(pidns_path) = d.sandbox_pidns_path {
+                let mut sandbox_pidns = Namespace::new(&logger);
+                sandbox_pidns.path = pidns_path.to_string();
+                sandbox.sandbox_pidns = Some(sandbox_pidns);
+            }
+
+            let mut oci = Spec::default();
+            if d.has_linux_in_spec {
+                oci.linux = Some(Linux {
+                    namespaces: d.namespaces.clone(),
+                    ..Default::default()
+                });
+            }
+
+            let result = update_container_namespaces(&sandbox, &mut oci, d.use_sandbox_pidns);
+
+            let msg = format!("{}, result: {:?}", msg, result);
+
+            assert_result!(d.result, result, msg);
+            if let Some(linux) = oci.linux {
+                assert_eq!(d.expected_namespaces, linux.namespaces, "{}", msg);
+            }
+        }
     }
 
     #[tokio::test]
@@ -2055,6 +2408,122 @@ mod tests {
             let msg = format!("{}, result: {:?}", msg, result);
 
             assert_result!(d.result, result, msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_is_signal_handled() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            status_file_data: Option<&'a str>,
+            signum: u32,
+            result: bool,
+        }
+
+        let tests = &[
+            TestData {
+                status_file_data: Some(
+                    r#"
+SigBlk:0000000000010000
+SigCgt:0000000000000001
+OtherField:other
+                "#,
+                ),
+                signum: 1,
+                result: true,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:000000004b813efb"),
+                signum: 4,
+                result: true,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:\t000000004b813efb"),
+                signum: 4,
+                result: true,
+            },
+            TestData {
+                status_file_data: Some("SigCgt: 000000004b813efb"),
+                signum: 4,
+                result: true,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:000000004b813efb "),
+                signum: 4,
+                result: true,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:\t000000004b813efb "),
+                signum: 4,
+                result: true,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:000000004b813efb"),
+                signum: 3,
+                result: false,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:000000004b813efb"),
+                signum: 65,
+                result: false,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:000000004b813efb"),
+                signum: 0,
+                result: true,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:ZZZZZZZZ"),
+                signum: 1,
+                result: false,
+            },
+            TestData {
+                status_file_data: Some("SigCgt:-1"),
+                signum: 1,
+                result: false,
+            },
+            TestData {
+                status_file_data: Some("SigCgt"),
+                signum: 1,
+                result: false,
+            },
+            TestData {
+                status_file_data: Some("any data"),
+                signum: 0,
+                result: true,
+            },
+            TestData {
+                status_file_data: Some("SigBlk:0000000000000001"),
+                signum: 1,
+                result: false,
+            },
+            TestData {
+                status_file_data: None,
+                signum: 1,
+                result: false,
+            },
+            TestData {
+                status_file_data: None,
+                signum: 0,
+                result: false,
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{}]: {:?}", i, d);
+
+            let dir = tempdir().expect("failed to make tempdir");
+            let proc_status_file_path = dir.path().join("status");
+
+            if let Some(file_data) = d.status_file_data {
+                fs::write(&proc_status_file_path, file_data).unwrap();
+            }
+
+            let result = is_signal_handled(proc_status_file_path.to_str().unwrap(), d.signum);
+
+            let msg = format!("{}, result: {:?}", msg, result);
+
+            assert_eq!(d.result, result, "{}", msg);
         }
     }
 
@@ -2283,5 +2752,67 @@ mod tests {
                 assert!(d.expect_error, "{}", msg);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_volume_capacity_stats() {
+        skip_if_not_root!();
+
+        // Verify error if path does not exist
+        assert!(get_volume_capacity_stats("/does-not-exist").is_err());
+
+        // Create a new tmpfs mount, and verify the initial values
+        let mount_dir = tempfile::tempdir().unwrap();
+        mount::mount(
+            Some("tmpfs"),
+            mount_dir.path().to_str().unwrap(),
+            Some("tmpfs"),
+            mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .unwrap();
+        let mut stats = get_volume_capacity_stats(mount_dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(stats.used, 0);
+        assert_ne!(stats.available, 0);
+        let available = stats.available;
+
+        // Verify that writing a file will result in increased utilization
+        fs::write(mount_dir.path().join("file.dat"), "foobar").unwrap();
+        stats = get_volume_capacity_stats(mount_dir.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(stats.used, 4 * 1024);
+        assert_eq!(stats.available, available - 4 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_get_volume_inode_stats() {
+        skip_if_not_root!();
+
+        // Verify error if path does not exist
+        assert!(get_volume_inode_stats("/does-not-exist").is_err());
+
+        // Create a new tmpfs mount, and verify the initial values
+        let mount_dir = tempfile::tempdir().unwrap();
+        mount::mount(
+            Some("tmpfs"),
+            mount_dir.path().to_str().unwrap(),
+            Some("tmpfs"),
+            mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .unwrap();
+        let mut stats = get_volume_inode_stats(mount_dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(stats.used, 1);
+        assert_ne!(stats.available, 0);
+        let available = stats.available;
+
+        // Verify that creating a directory and writing a file will result in increased utilization
+        let dir = mount_dir.path().join("foobar");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.as_path().join("file.dat"), "foobar").unwrap();
+        stats = get_volume_inode_stats(mount_dir.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(stats.used, 3);
+        assert_eq!(stats.available, available - 2);
     }
 }

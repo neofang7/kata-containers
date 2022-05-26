@@ -124,14 +124,10 @@ func TestSetEphemeralStorageType(t *testing.T) {
 
 	assert := assert.New(t)
 
-	dir, err := os.MkdirTemp(testDir, "foo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	ephePath := filepath.Join(dir, vc.K8sEmptyDir, "tmp-volume")
-	err = os.MkdirAll(ephePath, testDirMode)
+	err := os.MkdirAll(ephePath, testDirMode)
 	assert.Nil(err)
 
 	err = syscall.Mount("tmpfs", ephePath, "tmpfs", 0, "")
@@ -216,7 +212,6 @@ func TestCreateSandboxConfigFail(t *testing.T) {
 	assert := assert.New(t)
 
 	tmpdir, bundlePath, _ := ktu.SetupOCIConfigFile(t)
-	defer os.RemoveAll(tmpdir)
 
 	runtimeConfig, err := newTestRuntimeConfig(tmpdir, testConsole, true)
 	assert.NoError(err)
@@ -250,7 +245,6 @@ func TestCreateSandboxFail(t *testing.T) {
 	assert := assert.New(t)
 
 	tmpdir, bundlePath, _ := ktu.SetupOCIConfigFile(t)
-	defer os.RemoveAll(tmpdir)
 
 	runtimeConfig, err := newTestRuntimeConfig(tmpdir, testConsole, true)
 	assert.NoError(err)
@@ -273,7 +267,6 @@ func TestCreateSandboxAnnotations(t *testing.T) {
 	assert := assert.New(t)
 
 	tmpdir, bundlePath, _ := ktu.SetupOCIConfigFile(t)
-	defer os.RemoveAll(tmpdir)
 
 	runtimeConfig, err := newTestRuntimeConfig(tmpdir, testConsole, true)
 	assert.NoError(err)
@@ -308,17 +301,13 @@ func TestCreateSandboxAnnotations(t *testing.T) {
 func TestCheckForFips(t *testing.T) {
 	assert := assert.New(t)
 
-	path, err := os.MkdirTemp("", "")
-	assert.NoError(err)
-	defer os.RemoveAll(path)
-
 	val := procFIPS
-	procFIPS = filepath.Join(path, "fips-enabled")
+	procFIPS = filepath.Join(t.TempDir(), "fips-enabled")
 	defer func() {
 		procFIPS = val
 	}()
 
-	err = os.WriteFile(procFIPS, []byte("1"), 0644)
+	err := os.WriteFile(procFIPS, []byte("1"), 0644)
 	assert.NoError(err)
 
 	hconfig := vc.HypervisorConfig{
@@ -350,8 +339,7 @@ func TestCheckForFips(t *testing.T) {
 func TestCreateContainerContainerConfigFail(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, bundlePath, ociConfigFile := ktu.SetupOCIConfigFile(t)
-	defer os.RemoveAll(tmpdir)
+	_, bundlePath, ociConfigFile := ktu.SetupOCIConfigFile(t)
 
 	spec, err := compatoci.ParseConfigJSON(bundlePath)
 	assert.NoError(err)
@@ -378,8 +366,7 @@ func TestCreateContainerContainerConfigFail(t *testing.T) {
 func TestCreateContainerFail(t *testing.T) {
 	assert := assert.New(t)
 
-	tmpdir, bundlePath, ociConfigFile := ktu.SetupOCIConfigFile(t)
-	defer os.RemoveAll(tmpdir)
+	_, bundlePath, ociConfigFile := ktu.SetupOCIConfigFile(t)
 
 	spec, err := compatoci.ParseConfigJSON(bundlePath)
 	assert.NoError(err)
@@ -413,8 +400,7 @@ func TestCreateContainer(t *testing.T) {
 		mockSandbox.CreateContainerFunc = nil
 	}()
 
-	tmpdir, bundlePath, ociConfigFile := ktu.SetupOCIConfigFile(t)
-	defer os.RemoveAll(tmpdir)
+	_, bundlePath, ociConfigFile := ktu.SetupOCIConfigFile(t)
 
 	spec, err := compatoci.ParseConfigJSON(bundlePath)
 	assert.NoError(err)

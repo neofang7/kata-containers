@@ -7,10 +7,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/url"
 
 	containerdshim "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2"
-	"github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
+	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils/shimclient"
 
 	"github.com/urfave/cli"
@@ -54,7 +55,10 @@ var addCommand = cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
-		return volume.Add(volumePath, mountInfo)
+		if err := volume.Add(volumePath, mountInfo); err != nil {
+			return cli.NewExitError(err.Error(), 1)
+		}
+		return nil
 	},
 }
 
@@ -69,7 +73,10 @@ var removeCommand = cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
-		return volume.Remove(volumePath)
+		if err := volume.Remove(volumePath); err != nil {
+			return cli.NewExitError(err.Error(), 1)
+		}
+		return nil
 	},
 }
 
@@ -83,13 +90,14 @@ var statsCommand = cli.Command{
 			Destination: &volumePath,
 		},
 	},
-	Action: func(c *cli.Context) (string, error) {
+	Action: func(c *cli.Context) error {
 		stats, err := Stats(volumePath)
 		if err != nil {
-			return "", err
+			return cli.NewExitError(err.Error(), 1)
 		}
 
-		return string(stats), nil
+		fmt.Println(string(stats))
+		return nil
 	},
 }
 
@@ -109,7 +117,10 @@ var resizeCommand = cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
-		return Resize(volumePath, size)
+		if err := Resize(volumePath, size); err != nil {
+			return cli.NewExitError(err.Error(), 1)
+		}
+		return nil
 	},
 }
 
@@ -119,8 +130,14 @@ func Stats(volumePath string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	urlSafeDevicePath := url.PathEscape(volumePath)
-	body, err := shimclient.DoGet(sandboxId, defaultTimeout, containerdshim.DirectVolumeStatUrl+"/"+urlSafeDevicePath)
+	volumeMountInfo, err := volume.VolumeMountInfo(volumePath)
+	if err != nil {
+		return nil, err
+	}
+
+	urlSafeDevicePath := url.PathEscape(volumeMountInfo.Device)
+	body, err := shimclient.DoGet(sandboxId, defaultTimeout,
+		fmt.Sprintf("%s?%s=%s", containerdshim.DirectVolumeStatUrl, containerdshim.DirectVolumePathKey, urlSafeDevicePath))
 	if err != nil {
 		return nil, err
 	}
@@ -133,8 +150,13 @@ func Resize(volumePath string, size uint64) error {
 	if err != nil {
 		return err
 	}
+	volumeMountInfo, err := volume.VolumeMountInfo(volumePath)
+	if err != nil {
+		return err
+	}
+
 	resizeReq := containerdshim.ResizeRequest{
-		VolumePath: volumePath,
+		VolumePath: volumeMountInfo.Device,
 		Size:       size,
 	}
 	encoded, err := json.Marshal(resizeReq)

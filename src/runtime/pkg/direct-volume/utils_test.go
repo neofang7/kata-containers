@@ -6,6 +6,7 @@
 package volume
 
 import (
+	b64 "encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -18,16 +19,17 @@ import (
 
 func TestAdd(t *testing.T) {
 	var err error
-	kataDirectVolumeRootPath, err = os.MkdirTemp(os.TempDir(), "add-test")
-	assert.Nil(t, err)
-	defer os.RemoveAll(kataDirectVolumeRootPath)
+	kataDirectVolumeRootPath = t.TempDir()
 	var volumePath = "/a/b/c"
-	var basePath = "a"
 	actual := MountInfo{
 		VolumeType: "block",
 		Device:     "/dev/sda",
 		FsType:     "ext4",
-		Options:    []string{"journal_dev", "noload"},
+		Metadata: map[string]string{
+			FSGroupMetadataKey:             "3000",
+			FSGroupChangePolicyMetadataKey: string(FSGroupChangeOnRootMismatch),
+		},
+		Options: []string{"journal_dev", "noload"},
 	}
 	buf, err := json.Marshal(actual)
 	assert.Nil(t, err)
@@ -41,22 +43,22 @@ func TestAdd(t *testing.T) {
 	assert.Equal(t, expected.Device, actual.Device)
 	assert.Equal(t, expected.FsType, actual.FsType)
 	assert.Equal(t, expected.Options, actual.Options)
+	assert.Equal(t, expected.Metadata, actual.Metadata)
 
+	_, err = os.Stat(filepath.Join(kataDirectVolumeRootPath, b64.URLEncoding.EncodeToString([]byte(volumePath))))
+	assert.Nil(t, err)
 	// Remove the file
 	err = Remove(volumePath)
 	assert.Nil(t, err)
-	_, err = os.Stat(filepath.Join(kataDirectVolumeRootPath, basePath))
+	_, err = os.Stat(filepath.Join(kataDirectVolumeRootPath, b64.URLEncoding.EncodeToString([]byte(volumePath))))
 	assert.True(t, errors.Is(err, os.ErrNotExist))
-
-	// Test invalid mount info json
-	assert.Error(t, Add(volumePath, "{invalid json}"))
+	_, err = os.Stat(filepath.Join(kataDirectVolumeRootPath))
+	assert.Nil(t, err)
 }
 
 func TestRecordSandboxId(t *testing.T) {
 	var err error
-	kataDirectVolumeRootPath, err = os.MkdirTemp(os.TempDir(), "recordSanboxId-test")
-	assert.Nil(t, err)
-	defer os.RemoveAll(kataDirectVolumeRootPath)
+	kataDirectVolumeRootPath = t.TempDir()
 
 	var volumePath = "/a/b/c"
 	mntInfo := MountInfo{
@@ -82,9 +84,7 @@ func TestRecordSandboxId(t *testing.T) {
 
 func TestRecordSandboxIdNoMountInfoFile(t *testing.T) {
 	var err error
-	kataDirectVolumeRootPath, err = os.MkdirTemp(os.TempDir(), "recordSanboxId-test")
-	assert.Nil(t, err)
-	defer os.RemoveAll(kataDirectVolumeRootPath)
+	kataDirectVolumeRootPath = t.TempDir()
 
 	var volumePath = "/a/b/c"
 	sandboxId := uuid.Generate().String()

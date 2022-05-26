@@ -176,6 +176,9 @@ DEFDISABLEBLOCK := false
 DEFSHAREDFS_CLH_VIRTIOFS := virtio-fs
 DEFSHAREDFS_QEMU_VIRTIOFS := virtio-fs
 DEFVIRTIOFSDAEMON := $(LIBEXECDIR)/kata-qemu/virtiofsd
+ifeq ($(ARCH),amd64)
+DEFVIRTIOFSDAEMON := $(LIBEXECDIR)/virtiofsd
+endif
 DEFVALIDVIRTIOFSDAEMONPATHS := [\"$(DEFVIRTIOFSDAEMON)\"]
 # Default DAX mapping cache size in MiB
 #if value is 0, DAX is not enabled
@@ -589,16 +592,14 @@ $(GENERATED_FILES): %: %.in $(MAKEFILE_LIST) VERSION .git-commit
 
 generate-config: $(CONFIGS)
 
-test: install-hook go-test
+test: hook go-test
 
-install-hook:
-	make -C virtcontainers hook
-	echo "installing mock hook"
-	sudo -E make -C virtcontainers install
+hook:
+	make -C pkg/katautils/mockhook
 
 go-test: $(GENERATED_FILES)
 	go clean -testcache
-	$(QUIET_TEST)../../ci/go-test.sh
+	$(QUIET_TEST)./go-test.sh
 
 fast-test: $(GENERATED_FILES)
 	go clean -testcache

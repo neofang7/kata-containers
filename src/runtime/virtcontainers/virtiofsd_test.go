@@ -7,7 +7,6 @@ package virtcontainers
 
 import (
 	"context"
-	"os"
 	"path"
 	"strings"
 	"testing"
@@ -16,7 +15,6 @@ import (
 )
 
 func TestVirtiofsdStart(t *testing.T) {
-	assert := assert.New(t)
 	// nolint: govet
 	type fields struct {
 		path       string
@@ -24,18 +22,12 @@ func TestVirtiofsdStart(t *testing.T) {
 		cache      string
 		extraArgs  []string
 		sourcePath string
-		debug      bool
 		PID        int
 		ctx        context.Context
 	}
 
-	sourcePath, err := os.MkdirTemp("", "")
-	assert.NoError(err)
-	defer os.RemoveAll(sourcePath)
-
-	socketDir, err := os.MkdirTemp("", "")
-	assert.NoError(err)
-	defer os.RemoveAll(socketDir)
+	sourcePath := t.TempDir()
+	socketDir := t.TempDir()
 
 	socketPath := path.Join(socketDir, "socket.s")
 
@@ -65,7 +57,6 @@ func TestVirtiofsdStart(t *testing.T) {
 				cache:      tt.fields.cache,
 				extraArgs:  tt.fields.extraArgs,
 				sourcePath: tt.fields.sourcePath,
-				debug:      tt.fields.debug,
 				PID:        tt.fields.PID,
 				ctx:        tt.fields.ctx,
 			}
@@ -93,7 +84,6 @@ func TestVirtiofsdArgs(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal(expected, strings.Join(args, " "))
 
-	v.debug = false
 	expected = "--syslog -o cache=none -o no_posix_lock -o source=/run/kata-shared/foo --fd=456 -f"
 	args, err = v.args(456)
 	assert.NoError(err)
@@ -103,13 +93,8 @@ func TestVirtiofsdArgs(t *testing.T) {
 func TestValid(t *testing.T) {
 	assert := assert.New(t)
 
-	sourcePath, err := os.MkdirTemp("", "")
-	assert.NoError(err)
-	defer os.RemoveAll(sourcePath)
-
-	socketDir, err := os.MkdirTemp("", "")
-	assert.NoError(err)
-	defer os.RemoveAll(socketDir)
+	sourcePath := t.TempDir()
+	socketDir := t.TempDir()
 
 	socketPath := socketDir + "socket.s"
 
@@ -123,7 +108,7 @@ func TestValid(t *testing.T) {
 
 	// valid case
 	v := newVirtiofsdFunc()
-	err = v.valid()
+	err := v.valid()
 	assert.NoError(err)
 
 	v = newVirtiofsdFunc()

@@ -27,6 +27,7 @@ import (
 	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client"
 	models "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/models"
 	ops "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/operations"
@@ -84,8 +85,6 @@ const (
 	fcMetricsFifo = "metrics.fifo"
 
 	defaultFcConfig = "fcConfig.json"
-	// storagePathSuffix mirrors persist/fs/fs.go:storagePathSuffix
-	storagePathSuffix = "vc"
 )
 
 // Specify the minimum version of firecracker supported
@@ -201,7 +200,7 @@ func (fc *firecracker) setConfig(config *HypervisorConfig) error {
 }
 
 // CreateVM For firecracker this call only sets the internal structure up.
-// The sandbox will be created and started through startSandbox().
+// The sandbox will be created and started through StartVM().
 func (fc *firecracker) CreateVM(ctx context.Context, id string, network Network, hypervisorConfig *HypervisorConfig) error {
 	fc.ctx = ctx
 
@@ -244,7 +243,7 @@ func (fc *firecracker) setPaths(hypervisorConfig *HypervisorConfig) {
 	// <cgroups_base>/<exec_file_name>/<id>/
 	hypervisorName := filepath.Base(hypervisorConfig.HypervisorPath)
 	//fs.RunStoragePath cannot be used as we need exec perms
-	fc.chrootBaseDir = filepath.Join("/run", storagePathSuffix)
+	fc.chrootBaseDir = filepath.Join("/run", fs.StoragePathSuffix)
 
 	fc.vmPath = filepath.Join(fc.chrootBaseDir, hypervisorName, fc.id)
 	fc.jailerRoot = filepath.Join(fc.vmPath, "root") // auto created by jailer
@@ -764,7 +763,7 @@ func (fc *firecracker) fcInitConfiguration(ctx context.Context) error {
 	return nil
 }
 
-// startSandbox will start the hypervisor for the given sandbox.
+// StartVM will start the hypervisor for the given sandbox.
 // In the context of firecracker, this will start the hypervisor,
 // for configuration, but not yet start the actual virtual machine
 func (fc *firecracker) StartVM(ctx context.Context, timeout int) error {
@@ -882,7 +881,7 @@ func (fc *firecracker) cleanupJail(ctx context.Context) {
 	}
 }
 
-// stopSandbox will stop the Sandbox's VM.
+// StopVM will stop the Sandbox's VM.
 func (fc *firecracker) StopVM(ctx context.Context, waitOnly bool) (err error) {
 	span, _ := katatrace.Trace(ctx, fc.Logger(), "StopVM", fcTracingTags, map[string]string{"sandbox_id": fc.id})
 	defer span.End()
@@ -931,7 +930,7 @@ func (fc *firecracker) fcAddNetDevice(ctx context.Context, endpoint Endpoint) {
 	// The implementation of rate limiter is based on TBF.
 	// Rate Limiter defines a token bucket with a maximum capacity (size) to store tokens, and an interval for refilling purposes (refill_time).
 	// The refill-rate is derived from size and refill_time, and it is the constant rate at which the tokens replenish.
-	refillTime := uint64(1000)
+	refillTime := uint64(utils.DefaultRateLimiterRefillTimeMilliSecs)
 	var rxRateLimiter models.RateLimiter
 	rxSize := fc.config.RxRateLimiterMaxRate
 	if rxSize > 0 {
@@ -939,7 +938,7 @@ func (fc *firecracker) fcAddNetDevice(ctx context.Context, endpoint Endpoint) {
 
 		// kata-defined rxSize is in bits with scaling factors of 1000, but firecracker-defined
 		// rxSize is in bytes with scaling factors of 1024, need reversion.
-		rxSize = revertBytes(rxSize / 8)
+		rxSize = utils.RevertBytes(rxSize / 8)
 		rxTokenBucket := models.TokenBucket{
 			RefillTime: &refillTime,
 			Size:       &rxSize,
@@ -956,7 +955,7 @@ func (fc *firecracker) fcAddNetDevice(ctx context.Context, endpoint Endpoint) {
 
 		// kata-defined txSize is in bits with scaling factors of 1000, but firecracker-defined
 		// txSize is in bytes with scaling factors of 1024, need reversion.
-		txSize = revertBytes(txSize / 8)
+		txSize = utils.RevertBytes(txSize / 8)
 		txTokenBucket := models.TokenBucket{
 			RefillTime: &refillTime,
 			Size:       &txSize,
@@ -1026,7 +1025,7 @@ func (fc *firecracker) fcUpdateBlockDrive(ctx context.Context, path, id string) 
 	return nil
 }
 
-// addDevice will add extra devices to firecracker.  Limited to configure before the
+// AddDevice will add extra devices to firecracker.  Limited to configure before the
 // virtual machine starts.  Devices include drivers and network interfaces only.
 func (fc *firecracker) AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error {
 	span, _ := katatrace.Trace(ctx, fc.Logger(), "AddDevice", fcTracingTags, map[string]string{"sandbox_id": fc.id})
@@ -1129,8 +1128,8 @@ func (fc *firecracker) HotplugRemoveDevice(ctx context.Context, devInfo interfac
 	}
 }
 
-// getSandboxConsole builds the path of the console where we can read
-// logs coming from the sandbox.
+// GetVMConsole builds the path of the console where we can read logs coming
+// from the sandbox.
 func (fc *firecracker) GetVMConsole(ctx context.Context, id string) (string, string, error) {
 	master, slave, err := console.NewPty()
 	if err != nil {
@@ -1266,16 +1265,4 @@ func (fc *firecracker) GenerateSocket(id string) (interface{}, error) {
 
 func (fc *firecracker) IsRateLimiterBuiltin() bool {
 	return true
-}
-
-// In firecracker, it accepts the size of rate limiter in scaling factors of 2^10(1024)
-// But in kata-defined rate limiter, for better Human-readability, we prefer scaling factors of 10^3(1000).
-// func revertByte reverts num from scaling factors of 1000 to 1024, e.g. 10000000(10MB) to 10485760.
-func revertBytes(num uint64) uint64 {
-	a := num / 1000
-	b := num % 1000
-	if a == 0 {
-		return num
-	}
-	return 1024*revertBytes(a) + b
 }

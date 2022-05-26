@@ -14,10 +14,6 @@ PROJECT_COMPONENT = kata-agent
 
 TARGET = $(PROJECT_COMPONENT)
 
-SOURCES := \
-  $(shell find . 2>&1 | grep -E '.*\.rs$$') \
-  Cargo.toml
-
 VERSION_FILE := ./VERSION
 VERSION := $(shell grep -v ^\# $(VERSION_FILE))
 COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
@@ -37,8 +33,16 @@ ifeq ($(SECCOMP),yes)
     override EXTRA_RUSTFEATURES += seccomp
 endif
 
+##VAR STANDARD_OCI_RUNTIME=yes|no define if agent enables standard oci runtime feature
+STANDARD_OCI_RUNTIME := no
+
+# Enable standard oci runtime feature of rust build
+ifeq ($(STANDARD_OCI_RUNTIME),yes)
+    override EXTRA_RUSTFEATURES += standard-oci-runtime
+endif
+
 ifneq ($(EXTRA_RUSTFEATURES),)
-    override EXTRA_RUSTFEATURES := --features $(EXTRA_RUSTFEATURES)
+    override EXTRA_RUSTFEATURES := --features "$(EXTRA_RUSTFEATURES)"
 endif
 
 include ../../utils.mk
@@ -108,14 +112,14 @@ $(TARGET): $(GENERATED_CODE) logging-crate-tests $(TARGET_PATH)
 logging-crate-tests:
 	make -C $(CWD)/../libs/logging
 
-$(TARGET_PATH): $(SOURCES) | show-summary
+$(TARGET_PATH): show-summary
 	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) --$(BUILD_TYPE) $(EXTRA_RUSTFEATURES)
 
 $(GENERATED_FILES): %: %.in
 	@sed $(foreach r,$(GENERATED_REPLACEMENTS),-e 's|@$r@|$($r)|g') "$<" > "$@"
 
 ##TARGET optimize: optimized  build
-optimize: $(SOURCES) | show-summary show-header
+optimize: show-summary show-header
 	@RUSTFLAGS="-C link-arg=-s $(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) --$(BUILD_TYPE) $(EXTRA_RUSTFEATURES)
 
 ##TARGET install: install agent

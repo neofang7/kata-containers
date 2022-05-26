@@ -168,6 +168,8 @@ virtio_fs_cache_size = @DEFVIRTIOFSCACHESIZE@
 #
 # Format example:
 #   ["-o", "arg1=xxx,arg2", "-o", "hello world", "--arg3=yyy"]
+# Examples:
+#   Set virtiofsd log level to debug : ["-o", "log_level=debug"] or ["-d"]
 #
 # see `virtiofsd -h` for possible options.
 virtio_fs_extra_args = @DEFVIRTIOFSEXTRAARGS@
@@ -386,6 +388,9 @@ valid_entropy_sources = @DEFVALIDENTROPYSOURCES@
 # If swap_in_bytes and memory_limit_in_bytes is not set, the size should
 # be default_memory.
 #enable_guest_swap = true
+
+# use legacy serial for guest console if available and implemented for architecture. Default false
+#use_legacy_serial = true
 
 [factory]
 # VM templating support. Once enabled, new VMs are created from template

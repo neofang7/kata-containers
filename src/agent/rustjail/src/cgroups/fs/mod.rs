@@ -391,7 +391,7 @@ fn set_memory_resources(cg: &cgroups::Cgroup, memory: &LinuxMemory, update: bool
 
     if let Some(swappiness) = memory.swappiness {
         if (0..=100).contains(&swappiness) {
-            mem_controller.set_swappiness(swappiness as u64)?;
+            mem_controller.set_swappiness(swappiness)?;
         } else {
             return Err(anyhow!(
                 "invalid value:{}. valid memory swappiness range is 0-100",
@@ -590,9 +590,9 @@ fn get_cpuacct_stats(cg: &cgroups::Cgroup) -> SingularPtrField<CpuUsage> {
 
         let h = lines_to_map(&cpuacct.stat);
         let usage_in_usermode =
-            (((*h.get("user").unwrap() * NANO_PER_SECOND) as f64) / *CLOCK_TICKS) as u64;
+            (((*h.get("user").unwrap_or(&0) * NANO_PER_SECOND) as f64) / *CLOCK_TICKS) as u64;
         let usage_in_kernelmode =
-            (((*h.get("system").unwrap() * NANO_PER_SECOND) as f64) / *CLOCK_TICKS) as u64;
+            (((*h.get("system").unwrap_or(&0) * NANO_PER_SECOND) as f64) / *CLOCK_TICKS) as u64;
 
         let total_usage = cpuacct.usage;
 
@@ -623,9 +623,9 @@ fn get_cpuacct_stats(cg: &cgroups::Cgroup) -> SingularPtrField<CpuUsage> {
     let cpu_controller: &CpuController = get_controller_or_return_singular_none!(cg);
     let stat = cpu_controller.cpu().stat;
     let h = lines_to_map(&stat);
-    let usage_in_usermode = *h.get("user_usec").unwrap();
-    let usage_in_kernelmode = *h.get("system_usec").unwrap();
-    let total_usage = *h.get("usage_usec").unwrap();
+    let usage_in_usermode = *h.get("user_usec").unwrap_or(&0);
+    let usage_in_kernelmode = *h.get("system_usec").unwrap_or(&0);
+    let total_usage = *h.get("usage_usec").unwrap_or(&0);
     let percpu_usage = vec![];
 
     SingularPtrField::some(CpuUsage {

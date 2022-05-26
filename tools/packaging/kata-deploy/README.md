@@ -11,7 +11,41 @@ be utilized to install Kata Containers on a running Kubernetes cluster.
 
 ### Install Kata on a running Kubernetes cluster
 
-#### Installing the latest image
+#### k3s cluster
+
+For your [k3s](https://k3s.io/) cluster, run:
+
+```sh
+$ git clone github.com/kata-containers/kata-containers
+```
+
+Check and switch to the stable branch of your choice, if wanted, and then run:
+
+```bash
+$ cd kata-containers/kata-containers/tools/packaging/kata-deploy
+$ kubectl apply -f kata-rbac/base/kata-rbac.yaml
+$ kubectl apply -k kata-deploy/overlays/k3s
+```
+
+#### RKE2 cluster
+
+For your [RKE2](https://docs.rke2.io/) cluster, run:
+
+```sh
+$ git clone github.com/kata-containers/kata-containers
+```
+
+Check and switch to the stable branch of your choice, if wanted, and then run:
+
+```bash
+$ cd kata-containers/kata-containers/tools/packaging/kata-deploy
+$ kubectl apply -f kata-rbac/base/kata-rbac.yaml
+$ kubectl apply -k kata-deploy/overlays/rke2
+```
+
+#### Vanilla Kubernetes cluster
+
+##### Installing the latest image
 
 The latest image refers to pre-release and release candidate content.  For stable releases, please, use the "stable" instructions.
 
@@ -20,29 +54,21 @@ $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-contai
 $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-deploy/base/kata-deploy.yaml
 ```
 
-#### Installing the stable image
+##### Installing the stable image
 
 The stable image refers to the last stable releases content.
 
 > **Note:** if you use a tagged version of the repo, the stable image does match that version.
 > For instance, if you use the 2.2.1 tagged version of the kata-deploy.yaml file, then the version 2.2.1 of the kata runtime will be deployed.
 
-```sh
+```bash
 $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-rbac/base/kata-rbac.yaml
 $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-deploy/base/kata-deploy-stable.yaml
 ```
 
-#### For your [k3s](https://k3s.io/) cluster, do:
-
-```sh
-$ GO111MODULE=auto go get github.com/kata-containers/kata-containers
-$ cd $GOPATH/src/github.com/kata-containers/kata-containers/tools/packaging/kata-deploy
-$ kubectl apply -k kata-deploy/overlays/k3s
-```
-
 #### Ensure kata-deploy is ready
-```sh
-kubectl -n kube-system wait --timeout=10m --for=condition=Ready -l name=kata-deploy pod
+```bash
+$ kubectl -n kube-system wait --timeout=10m --for=condition=Ready -l name=kata-deploy pod
 ```
 
 ### Run a sample workload
@@ -52,7 +78,7 @@ the `Pod` specification. The `runtimeClass` examples provided define a node sele
 which will ensure the workload is only scheduled on a node that has Kata Containers installed
 
 `runtimeClass` is a built-in type in Kubernetes. To apply each Kata Containers `runtimeClass`:
-```sh
+```bash
   $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/runtimeclasses/kata-runtimeClasses.yaml
 ```
 
@@ -85,25 +111,25 @@ spec:
 
 To run an example with `kata-clh`:
 
-```sh
+```bash
 $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/examples/test-deploy-kata-clh.yaml
 ```
 
 To run an example with `kata-fc`:
 
-```sh
+```bash
 $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/examples/test-deploy-kata-fc.yaml
 ```
 
 To run an example with `kata-qemu`:
 
-```sh
+```bash
 $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/examples/test-deploy-kata-qemu.yaml
 ```
 
 The following removes the test pods:
 
-```sh
+```bash
 $ kubectl delete -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/examples/test-deploy-kata-clh.yaml
 $ kubectl delete -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/examples/test-deploy-kata-fc.yaml
 $ kubectl delete -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/examples/test-deploy-kata-qemu.yaml
@@ -136,13 +162,13 @@ $ kubectl delete -f https://raw.githubusercontent.com/kata-containers/kata-conta
 
 #### Removing the stable image
 
-```sh
+```bash
 $ kubectl delete -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-deploy/base/kata-deploy-stable.yaml
 $ kubectl -n kube-system wait --timeout=10m --for=delete -l name=kata-deploy pod
 ```
 
 After ensuring kata-deploy has been deleted, cleanup the cluster:
-```sh
+```bash
 $ kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-cleanup/base/kata-cleanup-stable.yaml
 ```
 
@@ -150,7 +176,7 @@ The cleanup daemon-set will run a single time, cleaning up the node-label, which
 This process should take, at most, 5 minutes.
 
 After that, let's delete the cleanup daemon-set, the added RBAC and runtime classes:
-```sh
+```bash
 $ kubectl delete -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-cleanup/base/kata-cleanup-stable.yaml
 $ kubectl delete -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-rbac/base/kata-rbac.yaml
 $ kubectl delete -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/runtimeclasses/kata-runtimeClasses.yaml

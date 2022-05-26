@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"code.cloudfoundry.org/bytefmt"
+	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/drivers"
@@ -34,7 +35,6 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/mock"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
 const sysHugepagesDir = "/sys/kernel/mm/hugepages"
@@ -44,7 +44,7 @@ var (
 	testBlockDeviceCtrPath = "testBlockDeviceCtrPath"
 	testDevNo              = "testDevNo"
 	testNvdimmID           = "testNvdimmID"
-	testPCIPath, _         = vcTypes.PciPathFromString("04/02")
+	testPCIPath, _         = types.PciPathFromString("04/02")
 	testSCSIAddr           = "testSCSIAddr"
 	testVirtPath           = "testVirtPath"
 )
@@ -190,8 +190,7 @@ func TestKataAgentSendReq(t *testing.T) {
 func TestHandleEphemeralStorage(t *testing.T) {
 	k := kataAgent{}
 	var ociMounts []specs.Mount
-	mountSource := "/tmp/mountPoint"
-	os.Mkdir(mountSource, 0755)
+	mountSource := t.TempDir()
 
 	mount := specs.Mount{
 		Type:   KataEphemeralDevType,
@@ -211,8 +210,7 @@ func TestHandleEphemeralStorage(t *testing.T) {
 func TestHandleLocalStorage(t *testing.T) {
 	k := kataAgent{}
 	var ociMounts []specs.Mount
-	mountSource := "/tmp/mountPoint"
-	os.Mkdir(mountSource, 0755)
+	mountSource := t.TempDir()
 
 	mount := specs.Mount{
 		Type:   KataLocalDevType,
@@ -234,6 +232,7 @@ func TestHandleLocalStorage(t *testing.T) {
 }
 
 func TestHandleDeviceBlockVolume(t *testing.T) {
+	var gid = 2000
 	k := kataAgent{}
 
 	// nolint: govet
@@ -315,6 +314,27 @@ func TestHandleDeviceBlockVolume(t *testing.T) {
 				Source: testSCSIAddr,
 			},
 		},
+		{
+			BlockDeviceDriver: config.VirtioBlock,
+			inputMount: Mount{
+				FSGroup:             &gid,
+				FSGroupChangePolicy: volume.FSGroupChangeOnRootMismatch,
+			},
+			inputDev: &drivers.BlockDevice{
+				BlockDrive: &config.BlockDrive{
+					PCIPath:  testPCIPath,
+					VirtPath: testVirtPath,
+				},
+			},
+			resultVol: &pb.Storage{
+				Driver: kataBlkDevType,
+				Source: testPCIPath.String(),
+				FsGroup: &pb.FSGroup{
+					GroupId:           uint32(gid),
+					GroupChangePolicy: pbTypes.FSGroupChangePolicy_OnRootMismatch,
+				},
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -351,11 +371,11 @@ func TestHandleBlockVolume(t *testing.T) {
 	vDestination := "/VhostUserBlk/destination"
 	bDestination := "/DeviceBlock/destination"
 	dDestination := "/DeviceDirectBlock/destination"
-	vPCIPath, err := vcTypes.PciPathFromString("01/02")
+	vPCIPath, err := types.PciPathFromString("01/02")
 	assert.NoError(t, err)
-	bPCIPath, err := vcTypes.PciPathFromString("03/04")
+	bPCIPath, err := types.PciPathFromString("03/04")
 	assert.NoError(t, err)
-	dPCIPath, err := vcTypes.PciPathFromString("04/05")
+	dPCIPath, err := types.PciPathFromString("04/05")
 	assert.NoError(t, err)
 
 	vDev := drivers.NewVhostUserBlkDevice(&config.DeviceInfo{ID: vDevID})
@@ -390,10 +410,10 @@ func TestHandleBlockVolume(t *testing.T) {
 	mounts = append(mounts, vMount, bMount, dMount)
 
 	tmpDir := "/vhost/user/dir"
-	dm := manager.NewDeviceManager(manager.VirtioBlock, true, tmpDir, devices)
+	dm := manager.NewDeviceManager(config.VirtioBlock, true, tmpDir, devices)
 
 	sConfig := SandboxConfig{}
-	sConfig.HypervisorConfig.BlockDeviceDriver = manager.VirtioBlock
+	sConfig.HypervisorConfig.BlockDeviceDriver = config.VirtioBlock
 	sandbox := Sandbox{
 		id:         "100",
 		containers: containers,
@@ -609,7 +629,7 @@ func TestConstrainGRPCSpec(t *testing.T) {
 	assert.NotNil(g.Linux.Resources.Memory)
 	assert.Nil(g.Linux.Resources.Pids)
 	assert.Nil(g.Linux.Resources.BlockIO)
-	assert.Nil(g.Linux.Resources.HugepageLimits)
+	assert.Len(g.Linux.Resources.HugepageLimits, 0)
 	assert.Nil(g.Linux.Resources.Network)
 	assert.NotNil(g.Linux.Resources.CPU)
 	assert.Equal(g.Process.SelinuxLabel, "")
@@ -665,8 +685,7 @@ func TestHandleShm(t *testing.T) {
 	// In case the type of mount is ephemeral, the container mount is not
 	// shared with the sandbox shm.
 	ociMounts[0].Type = KataEphemeralDevType
-	mountSource := "/tmp/mountPoint"
-	os.Mkdir(mountSource, 0755)
+	mountSource := t.TempDir()
 	ociMounts[0].Source = mountSource
 	k.handleShm(ociMounts, sandbox)
 
@@ -751,9 +770,7 @@ func TestHandlePidNamespace(t *testing.T) {
 func TestAgentConfigure(t *testing.T) {
 	assert := assert.New(t)
 
-	dir, err := os.MkdirTemp("", "kata-agent-test")
-	assert.Nil(err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	k := &kataAgent{}
 	h := &mockHypervisor{}
@@ -761,7 +778,7 @@ func TestAgentConfigure(t *testing.T) {
 	id := "foobar"
 	ctx := context.Background()
 
-	err = k.configure(ctx, h, id, dir, c)
+	err := k.configure(ctx, h, id, dir, c)
 	assert.Nil(err)
 
 	err = k.configure(ctx, h, id, dir, c)
@@ -872,9 +889,7 @@ func TestAgentCreateContainer(t *testing.T) {
 		},
 	}
 
-	dir, err := os.MkdirTemp("", "kata-agent-test")
-	assert.Nil(err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	err = k.configure(context.Background(), &mockHypervisor{}, sandbox.id, dir, KataAgentConfig{})
 	assert.Nil(err)
@@ -984,8 +999,7 @@ func TestKataCleanupSandbox(t *testing.T) {
 
 	kataHostSharedDirSaved := kataHostSharedDir
 	kataHostSharedDir = func() string {
-		td, _ := os.MkdirTemp("", "kata-Cleanup")
-		return td
+		return t.TempDir()
 	}
 	defer func() {
 		kataHostSharedDir = kataHostSharedDirSaved
@@ -996,7 +1010,6 @@ func TestKataCleanupSandbox(t *testing.T) {
 	}
 
 	dir := kataHostSharedDir()
-	defer os.RemoveAll(dir)
 	err := os.MkdirAll(path.Join(dir, s.id), 0777)
 	assert.Nil(err)
 
@@ -1144,9 +1157,7 @@ func TestHandleHugepages(t *testing.T) {
 
 	assert := assert.New(t)
 
-	dir, err := ioutil.TempDir("", "hugepages-test")
-	assert.Nil(err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	k := kataAgent{}
 	var formattedSizes []string

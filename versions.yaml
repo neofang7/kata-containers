@@ -75,7 +75,7 @@ assets:
       url: "https://github.com/cloud-hypervisor/cloud-hypervisor"
       uscan-url: >-
         https://github.com/cloud-hypervisor/cloud-hypervisor/tags.*/v?(\d\S+)\.tar\.gz
-      version: "v22.1"
+      version: "v23.1"
 
     firecracker:
       description: "Firecracker micro-VMM"
@@ -83,13 +83,13 @@ assets:
       uscan-url: >-
         https://github.com/firecracker-microvm/firecracker/tags
         .*/v?(\d\S+)\.tar\.gz
-      version: "v0.23.1"
+      version: "v0.23.4"
 
     qemu:
       description: "VMM that uses KVM"
       url: "https://github.com/qemu/qemu"
-      version: "v6.1.0"
-      tag: "v6.1.0"
+      version: "v6.2.0"
+      tag: "v6.2.0"
       # Do not include any non-full release versions
       # Break the line *without CR or space being appended*, to appease
       # yamllint, and note the deliberate ' ' at the end of the expression.
@@ -100,8 +100,8 @@ assets:
         .*/v?(\d\S+)\.tar\.gz
       tdx:
         description: "VMM that uses KVM and supports TDX"
-        url: "https://github.com/intel/qemu-tdx"
-        tag: "tdx-qemu-2021.11.29-v6.0.0-rc1-mvp"
+        url: "https://github.com/intel/qemu-dcp"
+        tag: "SPR-BKC-QEMU-v2.2"
 
     qemu-experimental:
       description: "QEMU with virtiofs support"
@@ -233,19 +233,6 @@ externals:
       .*/v?(\d\S+)\.tar\.gz
     version: "v1.0.1"
 
-  musl:
-    description: |
-      The musl library is used to build the rust agent.
-    url: "https://www.musl-libc.org/"
-    uscan-url: >-
-      https://www.musl-libc.org/releases/
-      musl-([\d\.]+)\.tar\.gz
-    version: "1.1.23"
-    meta:
-      description: |
-        'newest-version' is the latest version known to work.
-      newest-version: "1.1.23"
-
   nydus:
     description: "Nydus image acceleration service"
     url: "https://github.com/dragonflyoss/image-service"
@@ -255,6 +242,17 @@ externals:
     description: "Snapshotter for Nydus image acceleration service"
     url: "https://github.com/containerd/nydus-snapshotter"
     version: "v0.1.0"
+
+  virtiofsd:
+    description: "vhost-user virtio-fs device backend written in Rust"
+    url: "https://gitlab.com/virtio-fs/virtiofsd"
+    version: "v1.2.0"
+    meta:
+      # From https://gitlab.com/virtio-fs/virtiofsd/-/releases/v1.2.0,
+      # this is the link labelled virtiofsd-v1.2.0.zip
+      #
+      # yamllint disable-line rule:line-length
+      binary: "https://gitlab.com/virtio-fs/virtiofsd/uploads/b26d9891caac83209a3fdd24bcf2ae86/virtiofsd-v1.2.0.zip"
 
 languages:
   description: |
